@@ -66,6 +66,17 @@ FALLBACK_SECRET_ASSIGNMENT_RE = re.compile(
 )
 
 
+def _role_from_name(name):
+    value = str(name or "").casefold()
+    if any(marker in value for marker in ("validation", "valid", "_val", "val_")):
+        return "validation"
+    if "test" in value:
+        return "test"
+    if "train" in value:
+        return "train"
+    return None
+
+
 def read_notebook(notebook_path):
     """Read a notebook and return code-cell sources for existing callers."""
     with open(notebook_path, "r", encoding="utf-8") as handle:
@@ -190,6 +201,45 @@ def _inside_loop(node, parents):
             return True
         current = parents.get(current)
     return False
+
+
+def _test_selection_type(node, parents):
+    """Classify why a metric is inside a loop using only local AST evidence."""
+    loop = _ancestor(node, parents, (ast.For,))
+    if loop is None:
+        return "unknown"
+    if isinstance(loop.iter, (ast.List, ast.Tuple)):
+        constructors = [
+            _call_name(item).split(".")[-1]
+            for item in loop.iter.elts if isinstance(item, ast.Call)
+        ]
+        if len(set(filter(None, constructors))) >= 2:
+            return "model_comparison"
+    target_names = {
+        item.id for item in ast.walk(loop.target) if isinstance(item, ast.Name)
+    }
+    parameter_markers = {
+        "c", "alpha", "lambda", "n_estimators", "max_depth", "min_samples_split",
+        "learning_rate", "hidden_layer_sizes", "k", "degree", "gamma",
+    }
+    if any(name.casefold() in parameter_markers for name in target_names):
+        return "hyperparameter_search"
+    for call in (item for item in ast.walk(loop) if isinstance(item, ast.Call)):
+        if call is node:
+            continue
+        argument_names = {
+            item.id
+            for argument in [*call.args, *(keyword.value for keyword in call.keywords)]
+            for item in ast.walk(argument)
+            if isinstance(item, ast.Name)
+        }
+        constructor = _call_name(call).split(".")[-1]
+        if target_names & argument_names and (
+            constructor.endswith(("Classifier", "Regressor"))
+            or constructor in RANDOM_STATE_ESTIMATORS
+        ):
+            return "hyperparameter_search"
+    return "repeated_test_evaluation"
 
 
 def _ancestor(node, parents, kinds):
@@ -360,7 +410,52 @@ def analyze_code_with_ast(code):
     }
     classification = _is_classification(tree, constructors)
     split_calls = [call for call in calls if _call_name(call).split(".")[-1] == "train_test_split"]
-    split_line = min((call.lineno for call in split_calls), default=None)
+    slice_split_nodes = []
+    slice_roles = set()
+    dataset_split_nodes = []
+    for assignment in (
+        node for node in ast.walk(tree) if isinstance(node, (ast.Assign, ast.AnnAssign))
+    ):
+        targets = assignment.targets if isinstance(assignment, ast.Assign) else [assignment.target]
+        target_names = []
+        for target in targets:
+            if isinstance(target, ast.Name):
+                target_names.append(target.id)
+            elif isinstance(target, (ast.Tuple, ast.List)):
+                target_names.extend(item.id for item in target.elts if isinstance(item, ast.Name))
+        if isinstance(assignment.value, ast.Subscript):
+            roles = {_role_from_name(name) for name in target_names}
+            roles.discard(None)
+            slice_node = assignment.value.slice
+            if (
+                not roles
+                and isinstance(slice_node, ast.Slice)
+                and slice_node.upper is not None
+                and (
+                    slice_node.lower is None
+                    or (isinstance(slice_node.lower, ast.Constant) and slice_node.lower.value == 0)
+                )
+            ):
+                roles.add("train")
+            if roles:
+                slice_split_nodes.append(assignment)
+                slice_roles.update(roles)
+        if (
+            isinstance(assignment.value, ast.Call)
+            and _call_name(assignment.value).split(".")[-1] == "split"
+            and len(target_names) >= 2
+            and any(_role_from_name(name) for name in target_names)
+        ):
+            dataset_split_nodes.append(assignment)
+            slice_roles.update(filter(None, (_role_from_name(name) for name in target_names)))
+    slice_split_detected = "train" in slice_roles and bool({"validation", "test"} & slice_roles)
+    split_detected = bool(split_calls or dataset_split_nodes or slice_split_detected)
+    split_line = min(
+        [call.lineno for call in split_calls]
+        + [node.lineno for node in dataset_split_nodes]
+        + ([min(node.lineno for node in slice_split_nodes)] if slice_split_detected else []),
+        default=None,
+    )
     fit_calls = []
     predict_calls = []
     metric_calls = []
@@ -592,7 +687,7 @@ def analyze_code_with_ast(code):
                         evidence=f"{name} 来自 {frame}[{target_column!r}]，而 {feature_name} 仍引用同一数据框。",
                     ))
 
-    if fit_calls and not split_calls:
+    if fit_calls and not split_detected:
         issues.append(_issue(
             "CODE_NO_VALIDATION_SPLIT", "Validation", "No Explicit Validation Split",
             "Medium", "Medium", "检测到模型训练，但未发现明确的训练/验证或训练/测试划分。",
@@ -752,12 +847,25 @@ def analyze_code_with_ast(code):
 
     for call in metric_calls:
         if _inside_loop(call, parents) and any("test" in name.casefold() for name in _names(call)):
+            selection_type = _test_selection_type(call, parents)
+            if selection_type == "model_comparison":
+                issue_type = "Test-set Used for Model Comparison"
+                message = "同一测试集被用于循环评价多个不同候选模型。"
+            elif selection_type == "hyperparameter_search":
+                issue_type = "Test-set Used for Hyperparameter Comparison"
+                message = "同一测试集被用于循环评价同一模型的多个超参数配置。"
+            else:
+                issue_type = "Repeated Test-set Evaluation Requires Review"
+                message = "测试集在循环中被重复评价；静态证据不足以确认比较对象。"
             issues.append(_issue(
-                "CODE_TEST_SET_OVERUSE", "Evaluation", "Test-set Overuse / Model Selection Leakage",
-                "High", "High", "循环或搜索过程中反复使用测试集变量比较候选模型或超参数。",
+                "CODE_TEST_SET_OVERUSE", "Evaluation", issue_type,
+                "High" if selection_type != "repeated_test_evaluation" else "Medium",
+                "High" if selection_type != "repeated_test_evaluation" else "Medium",
+                message,
                 "使用验证集进行选择和调参，仅在最终方案锁定后评估测试集。",
                 call, code,
                 root_cause_id=f"test-set-model-selection:{call.lineno}",
+                selection_type=selection_type,
             ))
         if _inside_loop(call, parents) and any(
             marker in name.casefold() for name in _names(call) for marker in ("val", "valid")

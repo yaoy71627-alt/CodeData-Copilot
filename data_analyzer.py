@@ -30,7 +30,11 @@ TARGET_NAMES = {"target", "label", "class", "outcome", "y"}
 BOOLEAN_TOKENS = {"true", "false", "yes", "no", "y", "n", "1", "0"}
 DATE_TOKEN_RE = re.compile(r"(?:\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}[-/]\d{1,2}[-/]\d{2,4})")
 NON_NEGATIVE_NAME_RE = re.compile(
-    r"(?:^|_)(?:selling_?price|price|fare|cost|amount|count|quantity|distance|mileage)(?:$|_)",
+    r"(?:^|_)(?:age|selling_?price|price|fare|cost|amount|count|quantity|distance|mileage)(?:$|_)",
+    re.I,
+)
+IDENTIFIER_NAME_RE = re.compile(
+    r"(?:^|_)(?:id|identifier|key|ticket|code|reference|ref|name)(?:$|_)",
     re.I,
 )
 
@@ -214,6 +218,20 @@ def _severity_for_rate(rate, medium=0.10, high=0.50):
     return "Low"
 
 
+def _model_column_status(column, data_flow):
+    """Describe model participation only when the flow proves it."""
+    flow = data_flow or {}
+    model_features = set(flow.get("model_features", []))
+    excluded = set(flow.get("excluded_features", []))
+    if column in model_features:
+        return "Included"
+    if column in excluded:
+        return "Excluded"
+    if model_features:
+        return "Excluded"
+    return "Unknown"
+
+
 def _numeric_statistics(series):
     numeric = pd.to_numeric(series, errors="coerce")
     finite = numeric[numeric.map(lambda value: pd.notna(value) and math.isfinite(float(value)))]
@@ -266,7 +284,7 @@ def _detect_identical_columns(df, issues):
                 ))
 
 
-def _detect_string_and_type_quality(df, issues, profiles):
+def _detect_string_and_type_quality(df, issues, profiles, data_flow=None):
     row_count = len(df)
     for column in df.columns:
         series = df[column]
@@ -290,11 +308,44 @@ def _detect_string_and_type_quality(df, issues, profiles):
         meaningful = stripped[
             (stripped != "") & (~stripped.str.casefold().isin(MISSING_TOKENS))
         ]
+        meaningful_unique_count = int(meaningful.nunique(dropna=True))
+        meaningful_unique_ratio = meaningful_unique_count / max(1, row_count)
+        normalized_name = re.sub(
+            r"[^a-z0-9]+", "_", str(column).strip().casefold()
+        ).strip("_")
+        identifier_name = bool(IDENTIFIER_NAME_RE.search(normalized_name))
+        identifier_notice_added = False
         if not meaningful.empty:
             numeric_parsed = pd.to_numeric(meaningful, errors="coerce")
             numeric_ratio = float(numeric_parsed.notna().mean())
             failed = meaningful[numeric_parsed.isna()]
-            if PARSE_SUCCESS_THRESHOLD <= numeric_ratio < 1 and not failed.empty:
+            identifier_representation = bool(
+                identifier_name
+                and meaningful_unique_ratio >= 0.50
+                and 0 < numeric_ratio < 1
+                and not failed.empty
+            )
+            if identifier_representation:
+                issues.append(_issue(
+                    "DQ_IDENTIFIER_REPRESENTATION", "Feature Quality",
+                    "Identifier-like / Structured String", "Low", "Medium",
+                    f"字段 {column} 更像标识符；数字形式和字母数字形式可同时是合法表示。",
+                    "保留为字符串并核对标识符语义；只有代码明确将其作为连续数值时才审查数值解析。",
+                    column=column,
+                    evidence=(
+                        f"identifier-like name; unique ratio={meaningful_unique_ratio:.2%}; "
+                        f"numeric-like={int(numeric_parsed.notna().sum())}; "
+                        f"non-numeric={int(numeric_parsed.isna().sum())}."
+                    ),
+                    count=len(meaningful), rate=meaningful_unique_ratio,
+                    sample_values=_samples(meaningful),
+                    issue_origin="Identifier-aware representation heuristic",
+                    issue_nature="Potential Identifier", action="Informational",
+                    score_impact=0,
+                    model_input_status=_model_column_status(column, data_flow),
+                ))
+                identifier_notice_added = True
+            elif PARSE_SUCCESS_THRESHOLD <= numeric_ratio < 1 and not failed.empty:
                 issues.append(_issue(
                     "DQ_NUMERIC_PARSE_ANOMALY", "Type Consistency", "Numeric Parsing Anomaly",
                     "Medium", "High",
@@ -424,7 +475,9 @@ def _detect_string_and_type_quality(df, issues, profiles):
                 count=unique_count, rate=unique_ratio, sample_values=_samples(stripped),
             ))
         normalized_name = str(column).strip().casefold()
-        name_suggests_id = bool(re.search(r"(?:^|_)(?:id|uuid|key|code)$", normalized_name))
+        name_suggests_id = bool(IDENTIFIER_NAME_RE.search(
+            re.sub(r"[^a-z0-9]+", "_", normalized_name).strip("_")
+        ))
         if row_count >= VERY_SMALL_ROW_THRESHOLD and unique_ratio >= POTENTIAL_ID_THRESHOLD and (
             not pd.api.types.is_numeric_dtype(series) or name_suggests_id
         ):
@@ -451,7 +504,7 @@ def _detect_string_and_type_quality(df, issues, profiles):
                 ))
 
 
-def _duplicate_split_analysis(df, row_hashes, data_flow):
+def _legacy_duplicate_split_analysis(df, row_hashes, data_flow):
     duplicates_exist = bool(row_hashes.duplicated(keep=False).any())
     split = (data_flow or {}).get("split", {})
     base = {
@@ -501,9 +554,156 @@ def _duplicate_split_analysis(df, row_hashes, data_flow):
         return {**base, "reason": f"划分重建失败：{exc}"}
 
 
+def _duplicate_scope(df, fields, train_indices, test_indices, *, semantic_source):
+    """Calculate one explicitly labelled duplicate scope."""
+    fields = [field for field in fields if field in df.columns]
+    if not fields:
+        return {
+            "status": "Unable to quantify", "fields": [], "duplicate_groups": None,
+            "cross_split_duplicate_groups": None, "shared_records": None,
+            "sample_rows": [], "reason": "No verified fields were available for this scope.",
+            "semantic_source": semantic_source,
+        }
+    hashes = pd.util.hash_pandas_object(df[fields], index=False)
+    train_counts = hashes.loc[train_indices].value_counts()
+    test_counts = hashes.loc[test_indices].value_counts()
+    shared = set(train_counts.index) & set(test_counts.index)
+    rows = [int(index) for index, value in hashes.items() if value in shared]
+    return {
+        "status": "Exact",
+        "fields": fields,
+        "duplicate_groups": int(hashes.value_counts().gt(1).sum()),
+        "cross_split_duplicate_groups": len(shared),
+        "shared_records": sum(
+            int(train_counts[value] + test_counts[value]) for value in shared
+        ),
+        "sample_rows": rows[:20],
+        "reason": None,
+        "semantic_source": semantic_source,
+    }
+
+
+def _business_id_candidates(df, explicit_columns=None):
+    explicit = [column for column in (explicit_columns or []) if column in df.columns]
+    if explicit:
+        return [explicit], "Explicit business constraint"
+    candidates = []
+    for column in df.columns:
+        normalized = re.sub(r"[^a-z0-9]+", "_", str(column).casefold()).strip("_")
+        tokens = set(normalized.split("_"))
+        identifier_name = bool(
+            tokens & {"id", "identifier", "key", "ticket", "name"}
+            or normalized.endswith(("_id", "id", "_number", "number", "_no"))
+        )
+        if identifier_name and 1 < df[column].nunique(dropna=True) < len(df):
+            candidates.append([column])
+    return candidates, "Inferred from identifier-like field name; business semantics require confirmation"
+
+
+def _duplicate_split_analysis(
+    df, row_hashes, data_flow, csv_path=None, business_id_columns=None,
+):
+    """Reconstruct modeling rows first, then calculate named duplicate scopes."""
+    base = {
+        "status": "Unable to quantify",
+        "scope": None,
+        "fields": [],
+        "duplicate_groups": int(row_hashes.value_counts().gt(1).sum()),
+        "cross_split_duplicate_groups": None,
+        "shared_records": None,
+        "sample_rows": [],
+        "reason": None,
+        "scopes": {},
+        "modeling_data": {},
+    }
+    if not csv_path:
+        return {**base, "reason": "CSV path was not supplied for safe data-flow replay."}
+    try:
+        from data_flow_analyzer import reconstruct_modeling_data
+
+        reconstruction = reconstruct_modeling_data(data_flow, csv_path)
+    except Exception as exc:
+        return {**base, "reason": f"Modeling-data replay failed: {exc}"}
+    base["modeling_data"] = {
+        key: reconstruction.get(key) for key in (
+            "status", "reason", "source_csv", "source_variable", "raw_rows",
+            "cleaned_rows", "model_input_variable", "model_input_columns",
+            "target_column", "flow_file", "field_reconstruction",
+            "unresolved_field_operations", "train_rows", "test_rows", "evidence_level",
+        )
+    }
+    if reconstruction.get("status") != "Exact":
+        return {
+            **base,
+            "reason": reconstruction.get("reason") or "Modeling rows could not be replayed.",
+        }
+
+    train_indices = reconstruction["train_indices"]
+    test_indices = reconstruction["test_indices"]
+    scopes = {
+        "raw_full_row": _duplicate_scope(
+            df, list(df.columns), train_indices, test_indices,
+            semantic_source="All original CSV columns on rows that survived modeling cleanup",
+        ),
+        "model_input_row": _duplicate_scope(
+            df, reconstruction.get("model_input_columns") or [], train_indices, test_indices,
+            semantic_source="Replayed model-input columns",
+        ),
+    }
+    if reconstruction.get("field_reconstruction") != "Exact":
+        scopes["model_input_row"] = {
+            **scopes["model_input_row"],
+            "status": "Unable to quantify",
+            "duplicate_groups": None,
+            "cross_split_duplicate_groups": None,
+            "shared_records": None,
+            "reason": "One or more model-input field expressions could not be safely replayed.",
+        }
+    candidate_groups, candidate_source = _business_id_candidates(df, business_id_columns)
+    business_scopes = [
+        _duplicate_scope(
+            df, fields, train_indices, test_indices, semantic_source=candidate_source,
+        )
+        for fields in candidate_groups
+    ]
+    if business_scopes:
+        business_scope = max(
+            business_scopes,
+            key=lambda item: item.get("cross_split_duplicate_groups") or 0,
+        )
+        business_scope["candidates"] = business_scopes
+        scopes["business_id"] = business_scope
+
+    primary_name = "business_id" if "business_id" in scopes else "model_input_row"
+    primary = scopes[primary_name]
+    return {
+        **base,
+        "status": primary.get("status", "Unable to quantify"),
+        "scope": primary_name,
+        "fields": primary.get("fields", []),
+        "duplicate_groups": primary.get("duplicate_groups"),
+        "cross_split_duplicate_groups": primary.get("cross_split_duplicate_groups"),
+        "shared_records": primary.get("shared_records"),
+        "sample_rows": primary.get("sample_rows", []),
+        "reason": primary.get("reason"),
+        "scopes": scopes,
+    }
+
+
 def analyze_csv(csv_path, constraints=None, business_rules=None, data_flow=None):
     """Analyze a CSV without modifying it; constraints are optional explicit business rules."""
-    constraints = {**(constraints or {}), **(business_rules or {})}
+    raw_constraints = {**(constraints or {}), **(business_rules or {})}
+    business_id_columns = list(raw_constraints.pop("business_id_columns", []) or [])
+    constraint_source = raw_constraints.pop("source", "Caller-provided business constraints")
+    nested_columns = raw_constraints.pop("columns", None)
+    if isinstance(nested_columns, dict):
+        raw_constraints.update(nested_columns)
+    constraints = {
+        column: dict(rule) for column, rule in raw_constraints.items() if isinstance(rule, dict)
+    }
+    for rule in constraints.values():
+        if rule.get("non_negative") and rule.get("min") is None:
+            rule["min"] = 0
     df, raw_header = _read_csv(csv_path)
     rows, columns = df.shape
     issues = []
@@ -533,6 +733,11 @@ def analyze_csv(csv_path, constraints=None, business_rules=None, data_flow=None)
         "numeric_variable_types": {},
         "categorical_profiles": {},
         "analysis_limits": [],
+        "business_constraints": {
+            "source": constraint_source,
+            "columns": constraints,
+            "business_id_columns": business_id_columns,
+        },
     }
 
     if rows == 0 or columns == 0:
@@ -618,7 +823,10 @@ def analyze_csv(csv_path, constraints=None, business_rules=None, data_flow=None)
             sequential = numeric.notna().all() and len(numeric) > 0 and all(
                 float(value) == index for index, value in enumerate(numeric.tolist())
             )
-            if sequential or series.nunique(dropna=True) / max(1, rows) >= POTENTIAL_ID_THRESHOLD:
+            unique_count = int(series.nunique(dropna=True))
+            unique_ratio = unique_count / max(1, int(series.notna().sum()))
+            if sequential or unique_ratio >= POTENTIAL_ID_THRESHOLD:
+                model_status = _model_column_status(column, data_flow)
                 issues.append(_issue(
                     "DQ_POTENTIAL_INDEX_COLUMN", "Structure", "Potential Index Column",
                     "Low", "High" if sequential else "Medium",
@@ -626,7 +834,11 @@ def analyze_csv(csv_path, constraints=None, business_rules=None, data_flow=None)
                     "确认该字段是否有业务含义；若只是导出索引，可在建模输入中排除。",
                     column=column,
                     evidence="值与 0..N-1 顺序完全一致。" if sequential else "字段名和唯一值比例均类似索引。",
-                    count=rows, rate=1.0, sample_values=_samples(series),
+                    count=unique_count, rate=unique_ratio, sample_values=_samples(series),
+                    model_input_status=model_status,
+                    issue_nature="Potential Identifier",
+                    action="Informational" if model_status == "Excluded" else "Review",
+                    score_impact=0 if model_status == "Excluded" else None,
                 ))
 
         if not pd.api.types.is_numeric_dtype(series):
@@ -655,6 +867,38 @@ def analyze_csv(csv_path, constraints=None, business_rules=None, data_flow=None)
                     count=int(count), rate=rate, sample_values=_samples(actual), token=token,
                 ))
 
+    # Explicit categorical domains are confirmed rules.  Name-based semantic
+    # hints remain separate potential findings below and never inherit High
+    # confidence from these caller-provided constraints.
+    for column, constraint in constraints.items():
+        if column not in df.columns:
+            result["analysis_limits"].append(
+                f"Configured business constraint references missing column {column!r}."
+            )
+            continue
+        allowed = constraint.get("allowed_values", constraint.get("categories"))
+        if allowed is None:
+            continue
+        allowed_values = list(allowed)
+        series = df[column]
+        violation = series.notna() & ~series.isin(allowed_values)
+        if violation.any():
+            count = int(violation.sum())
+            rate = count / max(1, int(series.notna().sum()))
+            issues.append(_issue(
+                "DQ_CONSTRAINT_VIOLATION", "Invalid Values", "Confirmed Rule Violation",
+                "High" if rate >= 0.10 else "Medium", "High",
+                f"Column {column} contains values outside its explicit allowed domain.",
+                "Correct the upstream value or update the versioned business constraint after approval.",
+                column=column,
+                evidence=f"allowed_values={allowed_values!r}; violations={count} ({rate:.2%}).",
+                count=count, rate=rate, sample_values=_samples(series[violation]),
+                affected_rows=[int(index) for index in series[violation].index[:20]],
+                issue_origin=f"Explicit business rule: {constraint_source}",
+                issue_nature="Rule Violation", action="Fix",
+                constraint=dict(constraint), constraint_source=constraint_source,
+            ))
+
     row_hashes = pd.util.hash_pandas_object(df, index=False)
     hash_counts = row_hashes.value_counts()
     duplicate_hashes = set(hash_counts[hash_counts > 1].index)
@@ -680,7 +924,10 @@ def analyze_csv(csv_path, constraints=None, business_rules=None, data_flow=None)
             count=result["duplicate_rows"], rate=rate,
             issue_origin="Exact row hashing", issue_nature="Needs Review", action="Review",
         ))
-    result["duplicate_split_analysis"] = _duplicate_split_analysis(df, row_hashes, data_flow)
+    result["duplicate_split_analysis"] = _duplicate_split_analysis(
+        df, row_hashes, data_flow, csv_path=csv_path,
+        business_id_columns=business_id_columns,
+    )
     split_duplicates = result["duplicate_split_analysis"]
     if split_duplicates.get("status") == "Exact" and split_duplicates.get("cross_split_duplicate_groups"):
         issues.append(_issue(
@@ -689,20 +936,35 @@ def analyze_csv(csv_path, constraints=None, business_rules=None, data_flow=None)
             "可重建划分中，相同记录同时出现在训练集与测试集。",
             "在划分前按业务主键或完整记录审查重复来源；经确认后再去重。",
             evidence=(
-                f"重复组 {result['duplicate_groups']}；跨划分重复组 "
+                f"scope={split_duplicates.get('scope')}; "
+                f"fields={split_duplicates.get('fields', [])}; duplicate groups "
+                f"{split_duplicates.get('duplicate_groups')}；跨划分重复组 "
                 f"{split_duplicates['cross_split_duplicate_groups']}；共享记录 "
-                f"{split_duplicates['shared_records']}。"
+                f"{split_duplicates['shared_records']}；"
+                f"rows after cleanup={split_duplicates.get('modeling_data', {}).get('cleaned_rows')}。"
             ),
             count=split_duplicates["shared_records"],
-            rate=split_duplicates["shared_records"] / rows,
+            rate=(
+                split_duplicates["shared_records"]
+                / max(1, split_duplicates.get("modeling_data", {}).get("cleaned_rows") or rows)
+            ),
             affected_rows=split_duplicates.get("sample_rows", []),
             issue_origin="Reconstructed train_test_split",
             issue_nature="Needs Review",
             action="Review",
+            duplicate_scope=split_duplicates.get("scope"),
+            duplicate_fields=split_duplicates.get("fields", []),
+            calculation_scope=(
+                f"scope={split_duplicates.get('scope')}; "
+                f"fields={split_duplicates.get('fields', [])}; "
+                f"rows after cleanup={split_duplicates.get('modeling_data', {}).get('cleaned_rows')}"
+            ),
         ))
 
     _detect_identical_columns(df, issues)
-    _detect_string_and_type_quality(df, issues, result["categorical_profiles"])
+    _detect_string_and_type_quality(
+        df, issues, result["categorical_profiles"], data_flow=data_flow,
+    )
 
     numeric_columns = result["numeric_columns"]
     finite_numeric = pd.DataFrame(index=df.index)
@@ -731,6 +993,51 @@ def analyze_csv(csv_path, constraints=None, business_rules=None, data_flow=None)
         variable_profile = _numeric_variable_profile(column, finite)
         result["numeric_variable_types"][column] = variable_profile
         distribution_only = variable_profile["type"] != "continuous numeric"
+        if (
+            len(finite) >= 50
+            and variable_profile.get("integer_like")
+            and 4 <= variable_profile.get("unique_count", 0) <= 20
+        ):
+            value_counts = finite.value_counts().sort_index()
+            support_threshold = max(3, math.ceil(len(finite) * 0.01))
+            dominant = value_counts[value_counts >= support_threshold]
+            rare = value_counts[value_counts < support_threshold]
+            if len(dominant) >= 2 and not rare.empty:
+                dominant_values = sorted(float(value) for value in dominant.index)
+                contiguous = all(
+                    abs(right - left - 1) < 1e-9
+                    for left, right in zip(dominant_values, dominant_values[1:])
+                )
+                outside_values = [
+                    value for value in rare.index
+                    if float(value) < dominant_values[0] or float(value) > dominant_values[-1]
+                ]
+                outside_mask = finite_mask & series.isin(outside_values)
+                outside_count = int(outside_mask.sum())
+                coverage = float(dominant.sum() / len(finite))
+                if contiguous and coverage >= 0.95 and outside_count:
+                    rows_affected = [
+                        int(index) for index in series[outside_mask].index[:20]
+                    ]
+                    issues.append(_issue(
+                        "DQ_POTENTIAL_CATEGORICAL_DOMAIN_VIOLATION",
+                        "Categorical Quality", "Potential Categorical Domain Violation",
+                        "Medium", "Medium",
+                        f"字段 {column} 的绝大多数整数值形成稳定连续主域，少量值位于主域之外。",
+                        "将主域视为启发式证据并人工确认类别定义；不要据此自动改值或删除记录。",
+                        column=column,
+                        evidence=(
+                            f"dominant domain={[_clean_scalar(value) for value in dominant.index.tolist()]}; "
+                            f"coverage={coverage:.2%}; outside-domain records={outside_count}; "
+                            f"rows={rows_affected}."
+                        ),
+                        count=outside_count, rate=outside_count / max(1, len(finite)),
+                        sample_values=_samples(series[outside_mask]),
+                        affected_rows=rows_affected,
+                        issue_origin="Dominant categorical domain heuristic",
+                        issue_nature="Potential Business Rule", action="Review",
+                        dominant_domain=[_clean_scalar(value) for value in dominant.index.tolist()],
+                    ))
         skewness = stats.get("skewness")
         if (not distribution_only and skewness is not None
                 and len(finite) >= MIN_OUTLIER_SAMPLES and abs(float(skewness)) >= 3):
@@ -815,8 +1122,9 @@ def analyze_csv(csv_path, constraints=None, business_rules=None, data_flow=None)
                     column=column, evidence=f"约束={constraint}；违规 {count} 个（{rate:.2%}）。",
                     count=count, rate=rate, sample_values=_samples(series[violation]),
                     affected_rows=[int(index) for index in series[violation].index[:20]],
-                    issue_origin="Explicit business rule", issue_nature="Rule Violation", action="Fix",
-                    constraint=dict(constraint),
+                    issue_origin=f"Explicit business rule: {constraint_source}",
+                    issue_nature="Rule Violation", action="Fix",
+                    constraint=dict(constraint), constraint_source=constraint_source,
                 ))
         normalized_name = str(column).strip().casefold().replace(" ", "_")
         has_explicit_non_negative_rule = bool(
@@ -838,8 +1146,8 @@ def analyze_csv(csv_path, constraints=None, business_rules=None, data_flow=None)
                               f"行号={rows_affected}。"),
                     count=count, rate=rate, sample_values=_samples(series[negative_mask]),
                     affected_rows=rows_affected,
-                    issue_origin="Inferred from column semantics",
-                    issue_nature="Rule Violation", action="Review",
+                    issue_origin="Inferred from column-name semantics",
+                    issue_nature="Potential Business Rule", action="Review",
                     rule="value >= 0",
                 ))
 

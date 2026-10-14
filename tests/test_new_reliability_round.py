@@ -114,7 +114,8 @@ for n in [10, 50, 100]:
 """
         issues = analyze_code_with_ast(code)
         issue = next(item for item in issues if item["rule_id"] == "CODE_TEST_SET_OVERUSE")
-        self.assertEqual(issue["type"], "Test-set Overuse / Model Selection Leakage")
+        self.assertEqual(issue["type"], "Test-set Used for Hyperparameter Comparison")
+        self.assertEqual(issue["selection_type"], "hyperparameter_search")
 
     def test_07_discrete_count_feature_downgrades_iqr_to_distribution_review(self):
         values = [1, 2] * 20 + [0, 3, 5, 6]
@@ -187,7 +188,7 @@ class PipelineLabelEncoder(BaseEstimator, TransformerMixin):
             "corrected_code": "metric.equal_opportunity_difference()",
         }]
         checked = validate_repair_suggestions(suggestions, flow, [])
-        self.assertEqual(checked[0]["validation_status"], "Fully Validated")
+        self.assertEqual(checked[0]["validation_status"], "Syntax Valid Only")
 
     def test_13_fairness_before_reweighing_after_is_recognized(self):
         code = """

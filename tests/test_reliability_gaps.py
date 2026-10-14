@@ -246,7 +246,7 @@ model_data = model_data.dropna()
         missing = next(item for item in suggestions if item["problem"] == "Missing Value Handling Risk")
         self.assertNotIn("Cabin", missing.get("after_code") or "")
         self.assertIn("Age", missing.get("after_code") or "")
-        self.assertIn(missing["validation_status"], {"Fully Validated", "API Unverified", "Syntax Valid"})
+        self.assertIn(missing["validation_status"], {"Statically Validated", "API Unverified", "Syntax Valid Only"})
 
     def test_issue_nature_does_not_mark_rare_categories_as_fix(self):
         values = ["common"] * 199 + ["rare"]

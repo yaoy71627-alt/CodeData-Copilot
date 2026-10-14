@@ -12,6 +12,9 @@ def _safe_patch_path(location):
 
 
 def _suggestion_diff(suggestion):
+    status = suggestion.get("validation_status")
+    if status and status not in {"Runtime Verified", "Statically Validated"}:
+        return ""
     before = suggestion.get("before_code") or suggestion.get("original_code")
     after = suggestion.get("after_code") or suggestion.get("corrected_code")
     if not before or not after:

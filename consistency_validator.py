@@ -18,7 +18,17 @@ FAIRNESS_CONTRADICTIONS = (
     re.compile(r"\bno fairness (?:evaluation|metric|assessment)\b", re.I),
     re.compile(r"(?:没有|未发现|未进行|不存在).{0,10}(?:公平性评估|公平性指标|fairness)", re.I),
 )
-QUANTIFIED_CLAIM_RE = re.compile(r"(?P<number>\d+(?:\.\d+)?)\s*(?P<unit>%|行|rows?)", re.I)
+QUANTIFIED_CLAIM_RE = re.compile(
+    r"(?P<number>\d+(?:\.\d+)?)\s*(?P<unit>%|rows?|groups?|records?|行|条|组|个)",
+    re.I,
+)
+UNSUPPORTED_IMPACT_RE = re.compile(
+    r"(?:accuracy|准确率|精度)?.{0,10}(?:严重高估|显著高估|显著提升|显著降低|大幅偏差|严重降低)",
+    re.I,
+)
+UNSUPPORTED_BUSINESS_CONTEXT_RE = re.compile(
+    r"(?:救命场景|救命|医疗风险|金融风险|业务损失)", re.I,
+)
 
 
 def build_analysis_facts(
@@ -29,6 +39,7 @@ def build_analysis_facts(
     duplicate_split_analysis=None,
     business_rule_results=None,
     artifact_analysis=None,
+    skipped_files=None,
 ):
     """Build the sole structured fact bundle passed to AI and report renderers."""
     flow = data_flow or {}
@@ -39,6 +50,7 @@ def build_analysis_facts(
             "file": entry.get("file", "CSV"),
             "rows": result.get("shape", {}).get("rows", 0),
             "columns": result.get("shape", {}).get("columns", 0),
+            "column_names": list(result.get("data_types", {})),
             "missing_values": result.get("missing_values", {}),
             "duplicate_rows": result.get("duplicate_rows", 0),
             "duplicate_rate": result.get("duplicate_rate", 0),
@@ -64,6 +76,15 @@ def build_analysis_facts(
         "duplicate_split_analysis": duplicate_split_analysis or {},
         "business_rule_results": list(business_rule_results or []),
         "artifact_analysis": artifact_analysis or {"groups": [], "files": []},
+        "analysis_scope": {
+            "skipped_files": list(skipped_files or []),
+            "coverage_complete": not bool(skipped_files),
+            "statement": (
+                "All discovered supported files were analyzed."
+                if not skipped_files else
+                "Project coverage is partial; skipped dependencies/files are listed with reasons."
+            ),
+        },
         "formal_code_issues": [
             {**issue, "file": location.get("file"), "cell": location.get("cell")}
             for location in code_result or []
@@ -96,6 +117,21 @@ def _allowed_quantities(facts):
         if issue.get("rate") is not None:
             percent = float(issue["rate"]) * 100
             values.update({f"{percent:.1f}", f"{percent:.2f}"})
+    duplicate = facts.get("duplicate_split_analysis", {})
+    for scope in [duplicate, *(duplicate.get("scopes") or {}).values()]:
+        for key in ("duplicate_groups", "cross_split_duplicate_groups", "shared_records"):
+            if scope.get(key) is not None:
+                values.add(str(scope[key]))
+    modeling = duplicate.get("modeling_data", {})
+    for key in ("raw_rows", "cleaned_rows", "train_rows", "test_rows"):
+        if modeling.get(key) is not None:
+            values.add(str(modeling[key]))
+    roles = facts.get("split_role_analysis", {})
+    if roles.get("estimated_test_rows") is not None:
+        values.add(str(roles["estimated_test_rows"]))
+    if roles.get("test_ratio") is not None:
+        percent = float(roles["test_ratio"]) * 100
+        values.update({f"{percent:.1f}", f"{percent:.2f}"})
     return values
 
 
@@ -110,6 +146,7 @@ def validate_agent_consistency(agent_text, facts):
     fairness = facts.get("fairness", {})
     allowed = _allowed_quantities(facts)
     output = []
+    seen_limitations = set()
     for line in str(agent_text).splitlines():
         corrected = line
         if split_detected and any(pattern.search(corrected) for pattern in SPLIT_CONTRADICTIONS):
@@ -129,9 +166,31 @@ def validate_agent_consistency(agent_text, facts):
             corrections.append("移除了与 fairness evaluation 事实冲突的 AI 表述。")
         claims = list(QUANTIFIED_CLAIM_RE.finditer(corrected))
         unsupported = [match.group("number") for match in claims if match.group("number") not in allowed]
-        if unsupported and re.search(r"估算|估计|大约|约\s*\d|approximately|estimated", corrected, re.I):
-            corrected = "Unable to verify automatically. 原 AI 数量估算未写入正式报告。"
-            corrections.append("移除了未由 Analyzer 支持的 AI 数量估算。")
+        if unsupported:
+            corrected = (
+                "Unable to verify automatically: the quantitative claim was not supported "
+                "by analyzer facts."
+            )
+            corrections.append(
+                "Removed a row/record/group/percentage claim not supported by analyzer facts."
+            )
+        if UNSUPPORTED_IMPACT_RE.search(corrected):
+            corrected = "该问题可能造成评价偏差；当前静态分析没有量化其影响幅度。"
+            corrections.append("移除了缺少定量或运行时证据的影响程度表述。")
+        if UNSUPPORTED_BUSINESS_CONTEXT_RE.search(corrected):
+            corrected = (
+                "若业务更关注正类漏判，可重点关注 recall；"
+                "具体指标优先级需结合项目明确记录的任务目标确定。"
+            )
+            corrections.append("移除了项目材料未支持的业务代价或场景假设。")
+        limitation_key = corrected.strip().casefold()
+        if (
+            ("unable to verify automatically" in limitation_key or "无法自动验证" in limitation_key)
+            and limitation_key in seen_limitations
+        ):
+            continue
+        if "unable to verify automatically" in limitation_key or "无法自动验证" in limitation_key:
+            seen_limitations.add(limitation_key)
         output.append(corrected)
     return "\n".join(output), list(dict.fromkeys(corrections))
 
@@ -142,6 +201,22 @@ def validate_report_consistency(report):
     facts = checked.get("analysis_facts", {})
     corrected_ai, corrections = validate_agent_consistency(checked.get("ai_review", ""), facts)
     checked["ai_review"] = corrected_ai
+
+    # Revalidate executable suggestions at the final report boundary.  This
+    # prevents a later formatter/caller from reintroducing a field or variable
+    # that was not available at the proposed execution location.
+    if checked.get("repair_suggestions"):
+        from repair_validator import validate_repair_suggestions
+
+        pseudo_results = [
+            {"file": dataset.get("file"), "result": {
+                "data_types": {column: "unknown" for column in dataset.get("column_names", [])}
+            }}
+            for dataset in facts.get("datasets", [])
+        ]
+        checked["repair_suggestions"] = validate_repair_suggestions(
+            checked["repair_suggestions"], facts.get("data_flow", {}), pseudo_results,
+        )
 
     if facts.get("detected_split"):
         before = len(checked.get("code_quality", {}).get("issues", []))
@@ -159,6 +234,14 @@ def validate_report_consistency(report):
         ]
         if len(checked["code_quality"]["issues"]) != before:
             corrections.append("移除了与项目级评价事实冲突的 No Explicit Evaluation。")
-    checked["code_quality"]["issue_count"] = len(checked.get("code_quality", {}).get("issues", []))
+    visible_issues = checked.get("code_quality", {}).get("issues", [])
+    checked["code_quality"]["issue_count"] = sum(
+        issue.get("score_impact") != 0 and issue.get("action") != "Informational"
+        for issue in visible_issues
+    )
+    checked["code_quality"]["informational_count"] = sum(
+        issue.get("score_impact") == 0 or issue.get("action") == "Informational"
+        for issue in visible_issues
+    )
     checked["consistency_corrections"] = list(dict.fromkeys(corrections))
     return checked

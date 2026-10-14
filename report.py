@@ -11,7 +11,12 @@ from data_flow_analyzer import flow_summary_text
 
 
 def count_code_issues(code_result):
-    return sum(len(item.get("issues", [])) for item in code_result or [])
+    return sum(
+        1
+        for item in code_result or []
+        for issue in item.get("issues", [])
+        if issue.get("score_impact") != 0 and issue.get("action") != "Informational"
+    )
 
 
 def build_data_issues(data_result):
@@ -136,6 +141,8 @@ def build_report_data(
                 "type": issue_type,
                 "severity": issue.get("severity", _severity(issue_type)),
                 "confidence": issue.get("confidence", "Medium"),
+                "action": issue.get("action", "Review"),
+                "score_impact": issue.get("score_impact"),
                 "file": file_name,
                 "affected_files": issue.get("affected_files") or location.get("affected_files") or [file_name],
                 "affected_locations": issue.get("affected_locations", []),
@@ -189,13 +196,18 @@ def build_report_data(
     health = dict(health or {})
     code_points = health.get("breakdown", {}).get("代码质量", 0)
     code_score = round(code_points / 35 * 100) if overview.get("python_file_count") else 0
+    actionable_code_issues = [
+        issue for issue in code_issues
+        if issue.get("score_impact") != 0 and issue.get("action") != "Informational"
+    ]
     return {
         "title": "CodeData-Copilot Analysis Report",
         "generated_at": datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M %Z"),
         "project_overview": overview,
         "code_quality": {
             "score": code_score,
-            "issue_count": len(code_issues),
+            "issue_count": len(actionable_code_issues),
+            "informational_count": len(code_issues) - len(actionable_code_issues),
             "issues": code_issues,
         },
         "data_quality": {
@@ -236,6 +248,7 @@ def build_markdown_report(report):
         "",
         f"- 代码质量评分：{code['score']}/100",
         f"- 问题数量：{code['issue_count']}",
+        f"- Informational notebook/scope notices: {code.get('informational_count', 0)}",
         "",
     ]
     facts = report.get("analysis_facts", {})
@@ -243,6 +256,14 @@ def build_markdown_report(report):
     task = facts.get("task_type", {})
     coverage = facts.get("metric_coverage", {})
     model_features = facts.get("model_features", [])
+    duplicate_facts = facts.get("duplicate_split_analysis", {})
+    modeling_facts = duplicate_facts.get("modeling_data", {})
+    dataset_columns = {
+        column for dataset in facts.get("datasets", [])
+        for column in dataset.get("column_names", [])
+    }
+    target_name = (facts.get("target") or {}).get("column")
+    non_model_columns = sorted(dataset_columns - set(model_features) - {target_name})
     lines.extend([
         "### 2.0 Data Flow Summary",
         "",
@@ -252,6 +273,11 @@ def build_markdown_report(report):
         f"- 任务类型：{task.get('type', 'Unknown')}（{task.get('confidence', 'Low')} confidence）",
         f"- 检测指标：{', '.join(facts.get('detected_metrics', [])) or 'Unable to verify automatically.'}",
         f"- 指标覆盖：{coverage.get('status', 'Unable to verify')}",
+        f"- 重建划分：Train {modeling_facts.get('train_rows')} / Test {modeling_facts.get('test_rows')}"
+        if modeling_facts.get("status") == "Exact" else
+        "- 重建划分：Unable to verify automatically.",
+        "- Not used in current model input: "
+        + (", ".join(non_model_columns) if model_features and non_model_columns else "None confirmed"),
         "",
     ])
     artifacts = facts.get("artifact_analysis", {})
@@ -268,6 +294,23 @@ def build_markdown_report(report):
                 ),
                 "  - Repeated matching findings count once; unique findings remain visible.",
             ])
+        lines.append("")
+
+    analysis_scope = facts.get("analysis_scope", {})
+    if analysis_scope:
+        lines.extend([
+            "### 2.0s Analysis Scope",
+            "",
+            f"- {analysis_scope.get('statement', '')}",
+        ])
+        for skipped in analysis_scope.get("skipped_files", []):
+            lines.append(
+                f"- Not inspected: `{skipped.get('path', '?')}` — {skipped.get('reason', 'reason unavailable')}"
+            )
+        if analysis_scope.get("skipped_files"):
+            lines.append(
+                "- Impact: findings about custom transformers and project-wide coverage exclude these files."
+            )
         lines.append("")
 
     split_roles = facts.get("split_role_analysis", {})
@@ -318,6 +361,7 @@ def build_markdown_report(report):
                 "",
                 f"- 严重程度：{issue['severity']}",
                 f"- 置信度：{issue.get('confidence', 'Medium')}",
+                f"- Classification: {issue.get('action', 'Review')}",
                 f"- 类别：{issue.get('category', 'Code Quality')}",
                 f"- 文件/位置：`{location}`",
                 f"- Affected Files ({len(issue.get('affected_files', []))})：{', '.join(issue.get('affected_files', []))}",
@@ -391,12 +435,13 @@ def build_markdown_report(report):
         for impact in impacts:
             if impact.get("quantification") == "Exact":
                 lines.extend([
-                    f"- `{impact.get('operation')}`：Exact",
+                    f"- `{impact.get('operation')}`：Exact（{impact.get('evidence_level', 'Reconstructed')}）",
                     f"  - Before: {impact.get('before')} rows",
                     f"  - After: {impact.get('after')} rows",
                     f"  - Removed: {impact.get('removed')} rows（{impact.get('removal_rate', 0):.2%}）",
                     f"  - Relevant columns: {', '.join(impact.get('relevant_columns', [])) or 'None detected'}",
                     f"  - Non-model columns: {', '.join(impact.get('non_model_columns', [])) or 'None'}",
+                    f"  - Calculation scope: {impact.get('calculation_scope', 'not recorded')}",
                 ])
             else:
                 lines.append(
@@ -425,13 +470,28 @@ def build_markdown_report(report):
         lines.extend(["### 3.z Duplicate Split Risk", ""])
         if duplicate_analysis.get("status") == "Exact":
             lines.extend([
-                f"- Duplicate groups: {duplicate_analysis.get('duplicate_groups', 0)}",
-                f"- Cross-split duplicate groups: {duplicate_analysis.get('cross_split_duplicate_groups', 0)}",
-                f"- Train/Test shared records: {duplicate_analysis.get('shared_records', 0)}",
+                f"- Primary scope: {duplicate_analysis.get('scope', 'unspecified')}",
+                f"- Fields: {', '.join(duplicate_analysis.get('fields', [])) or 'none'}",
+                f"- Duplicate groups ({duplicate_analysis.get('scope', 'scope')}): {duplicate_analysis.get('duplicate_groups', 0)}",
+                f"- Cross-split duplicate groups ({duplicate_analysis.get('scope', 'scope')}): {duplicate_analysis.get('cross_split_duplicate_groups', 0)}",
+                f"- Train/Test shared records ({duplicate_analysis.get('scope', 'scope')}): {duplicate_analysis.get('shared_records', 0)}",
+                f"- Row basis: raw={duplicate_analysis.get('modeling_data', {}).get('raw_rows')}, "
+                f"after cleanup={duplicate_analysis.get('modeling_data', {}).get('cleaned_rows')}",
+                f"- Reconstructed split: train={duplicate_analysis.get('modeling_data', {}).get('train_rows')}, "
+                f"test={duplicate_analysis.get('modeling_data', {}).get('test_rows')}",
+                f"- Evidence level: {duplicate_analysis.get('modeling_data', {}).get('evidence_level', 'Reconstructed')}",
             ])
+            for scope_name, scope in duplicate_analysis.get("scopes", {}).items():
+                lines.append(
+                    f"- Scope `{scope_name}` fields={scope.get('fields', [])}: "
+                    f"duplicate groups={scope.get('duplicate_groups')}, "
+                    f"cross-split groups={scope.get('cross_split_duplicate_groups')}, "
+                    f"shared records={scope.get('shared_records')} "
+                    f"(field source: {scope.get('semantic_source')})"
+                )
         else:
             lines.append(
-                "- Detected duplicate records, but the exact train/test overlap could not be reconstructed. "
+                "- Exact train/test overlap could not be reconstructed; no value is reported as Exact. "
                 + str(duplicate_analysis.get("reason") or "")
             )
         lines.append("")
@@ -568,7 +628,10 @@ def build_pdf_report(report):
         "Label", parent=body, fontSize=8, leading=11, textColor=colors.HexColor("#64748B"),
     )
     code_style = ParagraphStyle(
-        "Code", parent=body, fontName="Courier", fontSize=7.4, leading=10,
+        # Courier does not contain CJK glyphs and rendered Chinese comments as
+        # black squares.  The CID fallback is Unicode-capable for both prose
+        # and code; no font binary is bundled with the project.
+        "Code", parent=body, fontName=font_name, fontSize=7.4, leading=10,
         leftIndent=5, rightIndent=5, borderColor=colors.HexColor("#CBD5E1"),
         borderWidth=0.5, borderPadding=6, backColor=colors.HexColor("#F8FAFC"),
         spaceBefore=4, spaceAfter=7,
@@ -638,6 +701,16 @@ def build_pdf_report(report):
     flow = facts.get("data_flow", {})
     task = facts.get("task_type", {})
     coverage = facts.get("metric_coverage", {})
+    duplicate_facts = facts.get("duplicate_split_analysis", {})
+    modeling_facts = duplicate_facts.get("modeling_data", {})
+    dataset_columns = {
+        column for dataset in facts.get("datasets", [])
+        for column in dataset.get("column_names", [])
+    }
+    target_name = (facts.get("target") or {}).get("column")
+    non_model_columns = sorted(
+        dataset_columns - set(facts.get("model_features", [])) - {target_name}
+    )
     story.extend([
         p("Data Flow Summary", subheading),
         p(f"数据流：{flow_summary_text(flow)}"),
@@ -652,6 +725,15 @@ def build_pdf_report(report):
             f"指标：{', '.join(facts.get('detected_metrics', [])) or 'Unable to verify automatically.'}；"
             f"覆盖：{coverage.get('status', 'Unable to verify')}"
         ),
+        p(
+            f"重建划分：Train {modeling_facts.get('train_rows')} / Test {modeling_facts.get('test_rows')}"
+            if modeling_facts.get("status") == "Exact" else
+            "重建划分：Unable to verify automatically."
+        ),
+        p(
+            "Not used in current model input: "
+            + (", ".join(non_model_columns) if facts.get("model_features") and non_model_columns else "None confirmed")
+        ),
     ])
     artifacts = facts.get("artifact_analysis", {})
     if artifacts.get("groups"):
@@ -661,6 +743,19 @@ def build_pdf_report(report):
                 f"{group.get('type')} · Primary={group.get('primary')} · "
                 f"Affected Files ({len(group.get('files', []))})="
                 f"{', '.join(group.get('files', []))} · similarity={group.get('similarity', 1):.2%}"
+            ))
+    analysis_scope = facts.get("analysis_scope", {})
+    if analysis_scope:
+        story.append(p("Analysis Scope", subheading))
+        story.append(p(analysis_scope.get("statement", "")))
+        for skipped in analysis_scope.get("skipped_files", []):
+            story.append(p(
+                f"Not inspected: {skipped.get('path', '?')} — "
+                f"{skipped.get('reason', 'reason unavailable')}"
+            ))
+        if analysis_scope.get("skipped_files"):
+            story.append(p(
+                "Custom-transformer and project-wide conclusions exclude the files above."
             ))
     split_roles = facts.get("split_role_analysis", {})
     if split_roles:
@@ -776,7 +871,9 @@ def build_pdf_report(report):
                         f"{impact.get('operation')} · Exact：Before {impact.get('before')} rows；"
                         f"After {impact.get('after')} rows；Removed {impact.get('removed')} "
                         f"({impact.get('removal_rate', 0):.2%})；Relevant columns: "
-                        f"{', '.join(impact.get('relevant_columns', [])) or 'None detected'}"
+                        f"{', '.join(impact.get('relevant_columns', [])) or 'None detected'}；"
+                        f"Evidence={impact.get('evidence_level', 'Reconstructed')}；"
+                        f"Scope={impact.get('calculation_scope', 'not recorded')}"
                     ))
                 else:
                     story.append(p(
@@ -798,13 +895,20 @@ def build_pdf_report(report):
             story.append(p("Duplicate Split Risk", subheading))
             if duplicate_analysis.get("status") == "Exact":
                 story.append(p(
-                    f"Duplicate groups={duplicate_analysis.get('duplicate_groups', 0)}；"
-                    f"Cross-split groups={duplicate_analysis.get('cross_split_duplicate_groups', 0)}；"
-                    f"Shared records={duplicate_analysis.get('shared_records', 0)}"
+                    f"Scope={duplicate_analysis.get('scope', 'unspecified')}; "
+                    f"fields={duplicate_analysis.get('fields', [])}; "
+                    f"duplicate groups={duplicate_analysis.get('duplicate_groups', 0)}; "
+                    f"cross-split groups={duplicate_analysis.get('cross_split_duplicate_groups', 0)}; "
+                    f"shared records={duplicate_analysis.get('shared_records', 0)}; "
+                    f"raw rows={duplicate_analysis.get('modeling_data', {}).get('raw_rows')}; "
+                    f"rows after cleanup={duplicate_analysis.get('modeling_data', {}).get('cleaned_rows')}; "
+                    f"train/test={duplicate_analysis.get('modeling_data', {}).get('train_rows')}/"
+                    f"{duplicate_analysis.get('modeling_data', {}).get('test_rows')}; "
+                    f"evidence={duplicate_analysis.get('modeling_data', {}).get('evidence_level', 'Reconstructed')}"
                 ))
             else:
                 story.append(p(
-                    "Detected duplicate records, but the exact train/test overlap could not be reconstructed. "
+                    "Exact train/test overlap could not be reconstructed; no value is reported as Exact. "
                     + str(duplicate_analysis.get("reason") or "")
                 ))
     else:

@@ -3,11 +3,38 @@
 from __future__ import annotations
 
 import re
+import io
+import tokenize
 
 
 NON_PYTHON_CELL_MAGICS = {
     "bash", "sh", "script", "html", "javascript", "js", "latex", "sql", "ruby", "perl",
 }
+
+
+def _python_statement_is_open(lines):
+    """Return whether ``lines`` end inside an unfinished Python statement.
+
+    IPython permits a line magic at the start of a *new* statement, but ``%``
+    is also Python's modulo/string-formatting operator.  In particular, code
+    such as ``("%s"\n % value)`` is valid Python and must not be stripped.
+    Tokenization is a better fit than indentation heuristics because it also
+    covers explicit continuations and multi-line strings while remaining
+    independent of whether earlier complete statements can be executed.
+    """
+    prefix = "\n".join(lines)
+    if not prefix.strip():
+        return False
+    try:
+        list(tokenize.generate_tokens(io.StringIO(prefix + "\n").readline))
+    except (tokenize.TokenError, IndentationError) as exc:
+        message = str(exc).casefold()
+        return any(marker in message for marker in (
+            "multi-line statement", "multi-line string", "eof in multi-line",
+        ))
+    # A backslash continuation can be tokenized successfully after a newline
+    # is appended, so retain an explicit check for the physical last line.
+    return bool(lines and re.search(r"(?<!\\)\\\s*$", lines[-1]))
 
 
 def preprocess_notebook_source(source):
@@ -34,7 +61,8 @@ def preprocess_notebook_source(source):
         if cell_magic in NON_PYTHON_CELL_MAGICS:
             processed[index - 1] = ""
             continue
-        if stripped.startswith("%"):
+        statement_open = _python_statement_is_open(processed[:index - 1])
+        if stripped.startswith("%") and not statement_open:
             constructs.append({
                 "kind": "IPython Magic",
                 "subtype": "line_magic",
@@ -42,7 +70,7 @@ def preprocess_notebook_source(source):
                 "source": line,
             })
             processed[index - 1] = ""
-        elif stripped.startswith("!"):
+        elif stripped.startswith("!") and not statement_open:
             constructs.append({
                 "kind": "Shell Command",
                 "subtype": "shell_command",
@@ -50,7 +78,9 @@ def preprocess_notebook_source(source):
                 "source": line,
             })
             processed[index - 1] = ""
-        elif stripped.startswith("?") or (
+        elif (not statement_open and stripped.startswith("?")) or (
+            not statement_open
+            and
             stripped.endswith("?")
             and re.match(r"^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*\?\s*$", stripped)
         ):

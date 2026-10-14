@@ -137,7 +137,8 @@ class UpgradeTests(unittest.TestCase):
         ])
         self.assertEqual(len(suggestions), 1)
         self.assertIsNone(suggestions[0]["original_code"])
-        self.assertIn("X_test = scaler.transform(X_test)", suggestions[0]["corrected_code"])
+        self.assertIsNone(suggestions[0]["corrected_code"])
+        self.assertIn("X_test = scaler.transform(X_test)", suggestions[0]["conceptual_code"])
         self.assertTrue(suggestions[0]["requires_confirmation"])
 
     def test_patch_export_is_unified_diff_and_never_edits_source(self):
@@ -148,9 +149,9 @@ class UpgradeTests(unittest.TestCase):
             }]}
         ])
         patch_text = build_unified_patch(suggestions)
-        self.assertIn("--- a/model.py", patch_text)
-        self.assertIn("+++ b/model.py", patch_text)
-        self.assertIn("-scaler.fit_transform(X)", patch_text)
+        self.assertEqual(patch_text, "")
+        self.assertIsNone(suggestions[0]["after_code"])
+        self.assertIn("Recommendation Only", suggestions[0]["explanation"])
         self.assertEqual(source, "scaler.fit_transform(X)")
 
     def test_project_overview_detects_libraries_and_project_structure(self):
@@ -277,7 +278,16 @@ class UpgradeTests(unittest.TestCase):
         self.assertIn("## 5. Repair Suggestions", state.report_markdown)
         self.assertIsNotNone(state.report_pdf, state.report_error)
         self.assertTrue(state.report_pdf.startswith(b"%PDF"))
-        self.assertIn("--- a/model.py", state.patch_text)
+        # A standalone fit_transform snippet does not prove that y/X_train are
+        # available at this location.  The stricter repair validator must not
+        # export that generic split template as an executable model.py patch.
+        self.assertNotIn("--- a/model.py", state.patch_text)
+        model_repairs = [
+            item for item in state.repair_suggestions
+            if str(item.get("location", "")).startswith("model.py")
+        ]
+        self.assertTrue(model_repairs)
+        self.assertTrue(all(item["validation_status"] == "Recommendation Only" for item in model_repairs))
         self.assertFalse(state.report_error)
 
 

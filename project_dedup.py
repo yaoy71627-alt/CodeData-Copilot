@@ -192,12 +192,28 @@ def _normalized_snippet(issue):
 def _same_finding(left, right, group_type):
     if left.get("rule_id") != right.get("rule_id"):
         return False
+    left_root = re.sub(r":\d+$", "", str(left.get("root_cause_id") or ""))
+    right_root = re.sub(r":\d+$", "", str(right.get("root_cause_id") or ""))
+    if left_root and right_root and left_root == right_root:
+        return True
     left_text, right_text = _normalized_snippet(left), _normalized_snippet(right)
     if group_type == "Duplicate Analysis Artifact":
         return left_text == right_text
     if not left_text or not right_text:
         return left.get("type") == right.get("type")
-    return SequenceMatcher(None, left_text, right_text, autojunk=False).ratio() >= ISSUE_SNIPPET_THRESHOLD
+    similarity = SequenceMatcher(None, left_text, right_text, autojunk=False).ratio()
+    if similarity >= ISSUE_SNIPPET_THRESHOLD:
+        return True
+    # In near-copy notebooks a harmless literal/identifier edit can make a
+    # short snippet look dissimilar even though the same rule fires in the
+    # same relative cell.  Match that root cause, while callers below prevent
+    # two occurrences in the *same* file from being collapsed.
+    left_location = (left.get("affected_locations") or [{}])[0]
+    right_location = (right.get("affected_locations") or [{}])[0]
+    return bool(
+        left.get("type") == right.get("type")
+        and left_location.get("cell") == right_location.get("cell")
+    )
 
 
 def consolidate_duplicate_code_issues(code_result, artifact_analysis):
@@ -225,6 +241,8 @@ def consolidate_duplicate_code_issues(code_result, artifact_analysis):
             if membership_entry:
                 group_index, group = membership_entry
                 for candidate in candidates.get(group_index, []):
+                    if file_name in candidate["issue"].get("affected_files", []):
+                        continue
                     if _same_finding(candidate["issue"], copied, group.get("type")):
                         match = candidate
                         break

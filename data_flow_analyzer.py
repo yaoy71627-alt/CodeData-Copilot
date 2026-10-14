@@ -8,6 +8,7 @@ import math
 from pathlib import Path
 
 import nbformat
+import pandas as pd
 
 from notebook_syntax import preprocess_notebook_source
 
@@ -62,6 +63,55 @@ def _role_from_name(name):
     if "train" in value:
         return "train"
     return None
+
+
+def _loop_selection_details(node, parents):
+    current = (parents or {}).get(node)
+    loop = None
+    while current is not None:
+        if isinstance(current, ast.For):
+            loop = current
+            break
+        current = (parents or {}).get(current)
+    if loop is None:
+        return {"selection_type": "unknown", "candidate_models": []}
+    candidate_models = []
+    if isinstance(loop.iter, (ast.List, ast.Tuple)):
+        candidate_models = [
+            _call_name(item).split(".")[-1]
+            for item in loop.iter.elts if isinstance(item, ast.Call)
+        ]
+        candidate_models = list(dict.fromkeys(filter(None, candidate_models)))
+        if len(candidate_models) >= 2:
+            return {
+                "selection_type": "model_comparison",
+                "candidate_models": candidate_models,
+            }
+    target_names = {
+        item.id for item in ast.walk(loop.target) if isinstance(item, ast.Name)
+    }
+    parameter_markers = {
+        "c", "alpha", "lambda", "n_estimators", "max_depth", "min_samples_split",
+        "learning_rate", "hidden_layer_sizes", "k", "degree", "gamma",
+    }
+    if any(name.casefold() in parameter_markers for name in target_names):
+        return {"selection_type": "hyperparameter_search", "candidate_models": []}
+    for call in (item for item in ast.walk(loop) if isinstance(item, ast.Call)):
+        if call is node:
+            continue
+        constructor = _call_name(call).split(".")[-1]
+        argument_names = {
+            item.id
+            for argument in [*call.args, *(keyword.value for keyword in call.keywords)]
+            for item in ast.walk(argument)
+            if isinstance(item, ast.Name)
+        }
+        if target_names & argument_names and constructor.endswith(("Classifier", "Regressor")):
+            return {
+                "selection_type": "hyperparameter_search",
+                "candidate_models": [constructor],
+            }
+    return {"selection_type": "repeated_test_evaluation", "candidate_models": []}
 
 
 def _call_name(node):
@@ -145,6 +195,73 @@ def _constant_keyword(call, name, literals):
     return _literal_value(node, literals) if node is not None else None
 
 
+def _slice_spec(node, literals):
+    """Return a JSON-safe, statically reproducible slice description."""
+    if not isinstance(node, ast.Slice):
+        return None
+    values = {
+        "start": _literal_value(node.lower, literals) if node.lower is not None else None,
+        "stop": _literal_value(node.upper, literals) if node.upper is not None else None,
+        "step": _literal_value(node.step, literals) if node.step is not None else None,
+    }
+    unresolved = any(
+        expression is not None and values[key] is None
+        for key, expression in (("start", node.lower), ("stop", node.upper), ("step", node.step))
+    )
+    return {**values, "reconstructable": not unresolved}
+
+
+def _selector_spec(node, literals):
+    if isinstance(node, ast.Slice):
+        return {"kind": "slice", **_slice_spec(node, literals)}
+    value = _literal_value(node, literals)
+    if isinstance(value, (int, str)):
+        return {"kind": "scalar", "value": value, "reconstructable": True}
+    if isinstance(value, list):
+        return {"kind": "list", "value": value, "reconstructable": True}
+    return {"kind": "unknown", "value": _expr_label(node), "reconstructable": False}
+
+
+def _dataframe_selection_spec(node, literals):
+    """Describe an allowlisted dataframe selection without evaluating code."""
+    copied = False
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "copy"
+        and not node.args
+        and not node.keywords
+    ):
+        copied = True
+        node = node.func.value
+    if isinstance(node, ast.Name) and copied:
+        return {"operation": "assign", "input": node.id}
+    if not isinstance(node, ast.Subscript):
+        return None
+    if (
+        isinstance(node.value, ast.Attribute)
+        and node.value.attr in {"loc", "iloc"}
+        and isinstance(node.slice, ast.Tuple)
+        and len(node.slice.elts) == 2
+    ):
+        return {
+            "operation": f"{node.value.attr}_selection",
+            "input": _expr_label(node.value.value),
+            "row_selector": _selector_spec(node.slice.elts[0], literals),
+            "column_selector": _selector_spec(node.slice.elts[1], literals),
+        }
+    columns = _literal_value(node.slice, literals)
+    if isinstance(columns, str):
+        columns = [columns]
+    if isinstance(columns, list) and all(isinstance(item, str) for item in columns):
+        return {
+            "operation": "column_selection",
+            "input": _expr_label(node.value),
+            "columns": list(columns),
+        }
+    return None
+
+
 def _event_location(node, file_name=None, cell=None):
     return {
         "file": file_name,
@@ -165,6 +282,7 @@ def _empty_flow(file_name=None):
         "model_features": [],
         "split": {
             "detected": False,
+            "method": None,
             "line": None,
             "cell": None,
             "input_features": None,
@@ -179,6 +297,7 @@ def _empty_flow(file_name=None):
             "test_detected": False,
             "split_roles": {"train": [], "validation": [], "test": []},
             "calls": [],
+            "slices": [],
         },
         "preprocessing": [],
         "models": [],
@@ -205,9 +324,14 @@ def _empty_flow(file_name=None):
         },
         "object_types": {},
         "constructor_inputs": {},
+        "possible_object_types": {},
         "operations": [],
+        "replay_steps": [],
+        "definitions": {},
+        "reconstruction_limits": [],
         "variable_columns": {},
         "lineage": [],
+        "code_units": [],
         "notebook": {"execution_order": [], "hidden_state_risk": False},
     }
 
@@ -220,22 +344,118 @@ class _FlowBuilder:
         self.variable_columns = {}
         self.object_types = {}
         self.constructor_inputs = {}
+        self.possible_object_types = {}
         self.role_usage = {"train": [], "validation": [], "test": []}
         self.sequence = 0
+
+    def _add_replay_step(self, operation, node, cell, **details):
+        step = {
+            "order": len(self.flow["replay_steps"]) + 1,
+            "operation": operation,
+            **details,
+            **_event_location(node, self.flow["file"], cell),
+        }
+        self.flow["replay_steps"].append(step)
+        return step
 
     def _record_assignment(self, node, cell):
         names = _assignment_names(node)
         if not names:
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                if not (
+                    isinstance(target, ast.Subscript)
+                    and isinstance(target.value, ast.Name)
+                ):
+                    continue
+                column = _literal_value(target.slice, self.literals)
+                if not isinstance(column, str):
+                    continue
+                literal = _literal_value(node.value, self.literals)
+                self._add_replay_step(
+                    "set_column", node, cell, input=target.value.id, output=target.value.id,
+                    column=column, value=literal,
+                    reconstructable=literal is not None,
+                    expression=_expr_label(node.value),
+                )
             return
+        replay_count_before = len(self.flow["replay_steps"])
+        for name in names:
+            self.flow["definitions"].setdefault(name, []).append(
+                _event_location(node, self.flow["file"], cell)
+            )
         value = node.value
         literal = _literal_value(value, self.literals)
         if len(names) == 1 and literal is not None:
             self.literals[names[0]] = literal
 
+        selection = _dataframe_selection_spec(value, self.literals) if len(names) == 1 else None
+        if selection:
+            name = names[0]
+            operation = selection["operation"]
+            source = selection.get("input")
+            if operation == "assign":
+                if source in self.variable_columns:
+                    self.variable_columns[name] = list(self.variable_columns[source])
+                if source in self.object_types:
+                    self.object_types[name] = self.object_types[source]
+                self._add_replay_step("assign", node, cell, input=source, output=name)
+            elif operation == "column_selection":
+                columns = list(selection.get("columns") or [])
+                self.variable_columns[name] = columns
+                self.object_types[name] = (
+                    "Series" if len(columns) == 1 and name.casefold() in {"y", "target", "label"}
+                    else "DataFrame"
+                )
+                if name.casefold() in {"y", "target", "label"} and len(columns) == 1:
+                    self.flow["target"] = {"variable": name, "column": columns[0], "source": source}
+                elif name.casefold().startswith("x"):
+                    self.flow["feature_matrix"] = name
+                    self.flow["selected_features"] = columns
+                self.flow["lineage"].append({
+                    "from": source, "to": name, "operation": operation, "columns": columns,
+                })
+                self._add_replay_step(
+                    operation, node, cell, input=source, output=name, columns=columns,
+                )
+            else:
+                column_selector = selection.get("column_selector") or {}
+                selected_columns = (
+                    list(column_selector.get("value"))
+                    if column_selector.get("kind") == "list"
+                    and isinstance(column_selector.get("value"), list)
+                    else None
+                )
+                if selected_columns and all(isinstance(item, str) for item in selected_columns):
+                    self.variable_columns[name] = selected_columns
+                self.object_types[name] = "DataFrame"
+                if name.casefold().startswith("x"):
+                    self.flow["feature_matrix"] = name
+                    if selected_columns:
+                        self.flow["selected_features"] = selected_columns
+                if name.casefold() in {"y", "target", "label"}:
+                    target_column = (
+                        column_selector.get("value")
+                        if column_selector.get("kind") == "scalar"
+                        and isinstance(column_selector.get("value"), str)
+                        else None
+                    )
+                    self.flow["target"] = {
+                        "variable": name, "column": target_column, "source": source,
+                    }
+                self.flow["lineage"].append({
+                    "from": source, "to": name, "operation": operation,
+                })
+                self._add_replay_step(
+                    operation, node, cell, input=source, output=name,
+                    row_selector=selection.get("row_selector"),
+                    column_selector=column_selector,
+                )
+
         if isinstance(value, ast.Call):
             call_name = _call_name(value)
             short_name = call_name.split(".")[-1]
-            if len(names) == 1:
+            if len(names) == 1 and short_name != "copy":
                 self.constructors[names[0]] = short_name
                 self.object_types[names[0]] = short_name
                 self.constructor_inputs[names[0]] = {
@@ -252,6 +472,19 @@ class _FlowBuilder:
                 self.flow["source_data"].append(source)
                 self.object_types[names[0]] = "DataFrame"
                 self.flow["lineage"].append({"from": source.get("path") or call_name, "to": names[0], "operation": "load"})
+                self._add_replay_step(
+                    "load", node, cell, output=names[0], path=source.get("path"), reader=call_name,
+                )
+
+            if short_name == "get_dummies" and len(names) == 1 and value.args:
+                input_name = _expr_label(value.args[0])
+                self.object_types[names[0]] = "DataFrame"
+                self._add_replay_step(
+                    "get_dummies", node, cell, input=input_name, output=names[0],
+                    columns=_constant_keyword(value, "columns", self.literals),
+                    drop_first=bool(_constant_keyword(value, "drop_first", self.literals)),
+                    dummy_na=bool(_constant_keyword(value, "dummy_na", self.literals)),
+                )
 
             if short_name == "train_test_split" and len(names) >= 2:
                 args = [_expr_label(arg) for arg in value.args]
@@ -281,6 +514,7 @@ class _FlowBuilder:
                 split["calls"].append(split_event)
                 split.update({
                     "detected": True,
+                    "method": "train_test_split",
                     "line": node.lineno,
                     "cell": cell,
                     "input_features": args[0] if args else None,
@@ -298,9 +532,52 @@ class _FlowBuilder:
                             "to": output,
                             "operation": "train_test_split",
                         })
+                self._add_replay_step(
+                    "train_test_split", node, cell, inputs=args, outputs=names,
+                    roles=role_variables, test_size=split_event["test_size"],
+                    random_state=split_event["random_state"],
+                    stratify=split.get("stratify"),
+                )
+
+            if short_name == "split" and len(names) >= 2:
+                role_variables = {
+                    role: [name for name in names if _role_from_name(name) == role]
+                    for role in ("train", "validation", "test")
+                }
+                if any(role_variables.values()):
+                    receiver = _receiver_name(value)
+                    fractions = _literal_value(value.args[0], self.literals) if value.args else None
+                    split = self.flow["split"]
+                    split["detected"] = True
+                    split["method"] = "dataset_split"
+                    split["input_features"] = receiver
+                    split["line"] = node.lineno
+                    split["cell"] = cell
+                    for role, variables in role_variables.items():
+                        split["split_roles"][role] = list(dict.fromkeys([
+                            *split["split_roles"].get(role, []), *variables,
+                        ]))
+                        split[f"{role}_detected"] = bool(split["split_roles"][role])
+                    event = {
+                        "line": node.lineno, "cell": cell, "inputs": [receiver],
+                        "outputs": names, "roles": role_variables, "fractions": fractions,
+                        "shuffle": _constant_keyword(value, "shuffle", self.literals),
+                    }
+                    split["calls"].append(event)
+                    self._add_replay_step(
+                        "dataset_split", node, cell, input=receiver, outputs=names,
+                        roles=role_variables, fractions=fractions, shuffle=event["shuffle"],
+                    )
 
             if short_name in {"dropna", "drop_duplicates"} and len(names) == 1:
                 receiver = _receiver_name(value)
+                input_columns = None
+                receiver_expression = value.func.value if isinstance(value.func, ast.Attribute) else None
+                if isinstance(receiver_expression, ast.Subscript):
+                    receiver = _expr_label(receiver_expression.value)
+                    input_columns = _literal_value(receiver_expression.slice, self.literals)
+                    if isinstance(input_columns, str):
+                        input_columns = [input_columns]
                 subset = _constant_keyword(value, "subset", self.literals)
                 if isinstance(subset, str):
                     subset = [subset]
@@ -309,11 +586,19 @@ class _FlowBuilder:
                     "receiver": receiver,
                     "assigned_to": names[0],
                     "subset": subset,
+                    "input_columns": input_columns,
                     "inplace": bool(_constant_keyword(value, "inplace", self.literals)),
                     **_event_location(node, self.flow["file"], cell),
                 })
+                self._add_replay_step(
+                    short_name, node, cell, input=receiver, output=names[0],
+                    subset=subset, input_columns=input_columns,
+                    inplace=bool(_constant_keyword(value, "inplace", self.literals)),
+                )
                 if receiver in self.variable_columns:
                     self.variable_columns[names[0]] = list(self.variable_columns[receiver])
+                elif isinstance(input_columns, list):
+                    self.variable_columns[names[0]] = list(input_columns)
 
             if short_name == "predict" and len(names) == 1:
                 prediction_input = _expr_label(value.args[0]) if value.args else None
@@ -324,14 +609,15 @@ class _FlowBuilder:
                 self.flow["predict"].append(event)
                 self.flow["lineage"].append({"from": prediction_input, "to": names[0], "operation": "predict"})
 
-        if isinstance(value, ast.Name) and len(names) == 1:
+        if isinstance(value, ast.Name) and len(names) == 1 and not selection:
             if value.id in self.variable_columns:
                 self.variable_columns[names[0]] = list(self.variable_columns[value.id])
             self.flow["lineage"].append({"from": value.id, "to": names[0], "operation": "assign"})
             if value.id in self.object_types:
                 self.object_types[names[0]] = self.object_types[value.id]
+            self._add_replay_step("assign", node, cell, input=value.id, output=names[0])
 
-        if isinstance(value, ast.Subscript) and len(names) == 1:
+        if isinstance(value, ast.Subscript) and len(names) == 1 and not selection:
             source = _expr_label(value.value)
             columns = _literal_value(value.slice, self.literals)
             if isinstance(columns, str):
@@ -345,6 +631,77 @@ class _FlowBuilder:
                     self.flow["feature_matrix"] = names[0]
                     self.flow["selected_features"] = list(columns)
                 self.flow["lineage"].append({"from": source, "to": names[0], "operation": "column_selection", "columns": list(columns)})
+                self._add_replay_step(
+                    "column_selection", node, cell, input=source, output=names[0], columns=list(columns),
+                )
+            else:
+                if (
+                    isinstance(value.value, ast.Attribute)
+                    and value.value.attr in {"iloc", "loc"}
+                    and isinstance(value.slice, ast.Tuple)
+                    and len(value.slice.elts) == 2
+                ):
+                    source = _expr_label(value.value.value)
+                    row_selector = _selector_spec(value.slice.elts[0], self.literals)
+                    column_selector = _selector_spec(value.slice.elts[1], self.literals)
+                    self._add_replay_step(
+                        f"{value.value.attr}_selection", node, cell,
+                        input=source, output=names[0],
+                        row_selector=row_selector, column_selector=column_selector,
+                    )
+                    if names[0].casefold().startswith("x"):
+                        self.flow["feature_matrix"] = names[0]
+                    if names[0].casefold() in {"y", "target", "label"}:
+                        self.flow["target"] = {
+                            "variable": names[0], "column": None, "source": source,
+                        }
+                    self.flow["lineage"].append({
+                        "from": source, "to": names[0],
+                        "operation": f"{value.value.attr}_selection",
+                    })
+                    return
+                slice_spec = _slice_spec(value.slice, self.literals)
+                base_node = value.value
+                if isinstance(base_node, ast.Attribute) and base_node.attr in {"iloc", "loc"}:
+                    source = _expr_label(base_node.value)
+                if slice_spec and source:
+                    role = _role_from_name(names[0])
+                    if (
+                        role is None
+                        and slice_spec.get("reconstructable")
+                        and slice_spec.get("start") in {None, 0}
+                        and slice_spec.get("stop") is not None
+                    ):
+                        role = "train"
+                    self._add_replay_step(
+                        "row_slice", node, cell, input=source, output=names[0],
+                        slice=slice_spec, role=role,
+                    )
+                    self.flow["lineage"].append({
+                        "from": source, "to": names[0], "operation": "row_slice",
+                        "slice": slice_spec,
+                    })
+                    if source in self.variable_columns:
+                        self.variable_columns[names[0]] = list(self.variable_columns[source])
+                    if role:
+                        split = self.flow["split"]
+                        split["detected"] = True
+                        split["method"] = "slice"
+                        split["input_features"] = split.get("input_features") or source
+                        split["line"] = node.lineno
+                        split["cell"] = cell
+                        split["split_roles"][role] = list(dict.fromkeys([
+                            *split["split_roles"].get(role, []), names[0],
+                        ]))
+                        split[f"{role}_detected"] = True
+                        split["slices"].append({
+                            "source": source, "output": names[0], "role": role,
+                            "slice": slice_spec, **_event_location(node, self.flow["file"], cell),
+                        })
+                        if role == "train":
+                            split["train"] = list(dict.fromkeys([*split.get("train", []), names[0]]))
+                        if role == "test":
+                            split["test"] = list(dict.fromkeys([*split.get("test", []), names[0]]))
 
         if isinstance(value, ast.Call) and isinstance(value.func, ast.Attribute) and len(names) == 1:
             if value.func.attr == "drop":
@@ -362,6 +719,34 @@ class _FlowBuilder:
                     self.variable_columns[names[0]] = ["__all_except__", *excluded_columns]
                     self.object_types[names[0]] = "DataFrame"
                     self.flow["lineage"].append({"from": source, "to": names[0], "operation": "drop_columns", "columns": list(columns)})
+                    self._add_replay_step(
+                        "drop_columns", node, cell, input=source, output=names[0], columns=list(columns),
+                    )
+
+        if len(self.flow["replay_steps"]) == replay_count_before and len(names) == 1:
+            referenced = [
+                candidate.id for candidate in ast.walk(value)
+                if isinstance(candidate, ast.Name)
+                and (
+                    candidate.id in self.variable_columns
+                    or self.object_types.get(candidate.id) in {"DataFrame", "Series"}
+                    or any(
+                        source.get("variable") == candidate.id
+                        for source in self.flow.get("source_data", [])
+                    )
+                )
+            ]
+            if referenced and isinstance(value, (ast.Call, ast.Subscript, ast.BinOp, ast.Compare)):
+                self._add_replay_step(
+                    "unsupported", node, cell, input=referenced[0], output=names[0],
+                    expression=_expr_label(value),
+                    reason="dataframe transformation is outside the safe replay allowlist",
+                )
+                self.flow["reconstruction_limits"].append({
+                    "variable": names[0], "expression": _expr_label(value),
+                    "reason": "unsupported dataframe transformation",
+                    **_event_location(node, self.flow["file"], cell),
+                })
 
     def _record_call(self, call, cell, parents=None):
         self.sequence += 1
@@ -381,6 +766,7 @@ class _FlowBuilder:
             current = (parents or {}).get(current)
 
         purpose = None
+        selection_details = {"selection_type": None, "candidate_models": []}
         if short_name == "fit":
             purpose = "fit"
         elif short_name in {"fit_transform", "fit_resample"}:
@@ -388,7 +774,11 @@ class _FlowBuilder:
         elif short_name == "predict":
             purpose = "predict"
         elif short_name in CLASSIFICATION_METRICS or short_name in REGRESSION_METRICS:
-            purpose = "hyperparameter comparison" if in_loop else "metric"
+            if in_loop:
+                selection_details = _loop_selection_details(call, parents)
+                purpose = "test selection"
+            else:
+                purpose = "metric"
         if purpose:
             for variable in argument_names:
                 role = _role_from_name(variable)
@@ -398,6 +788,7 @@ class _FlowBuilder:
                         "purpose": purpose,
                         "object": receiver,
                         "in_loop": in_loop,
+                        **selection_details,
                         **_event_location(call, self.flow["file"], cell),
                     })
 
@@ -472,27 +863,82 @@ class _FlowBuilder:
                 "inplace": bool(_constant_keyword(call, "inplace", self.literals)),
                 **_event_location(call, self.flow["file"], cell),
             })
+            self._add_replay_step(
+                short_name, call, cell, input=receiver,
+                output=receiver if _constant_keyword(call, "inplace", self.literals) else None,
+                subset=subset, inplace=bool(_constant_keyword(call, "inplace", self.literals)),
+            )
+
+        if short_name == "drop" and bool(_constant_keyword(call, "inplace", self.literals)):
+            already_recorded = any(
+                step.get("line") == call.lineno and step.get("cell") == cell
+                and step.get("operation") == "drop_columns"
+                for step in self.flow["replay_steps"]
+            )
+            columns = _constant_keyword(call, "columns", self.literals)
+            axis = _constant_keyword(call, "axis", self.literals)
+            if columns is None and axis in {1, "columns"} and call.args:
+                columns = _literal_value(call.args[0], self.literals)
+            if isinstance(columns, str):
+                columns = [columns]
+            if not already_recorded and receiver and isinstance(columns, list):
+                self._add_replay_step(
+                    "drop_columns", call, cell, input=receiver, output=receiver,
+                    columns=list(columns), inplace=True,
+                )
+                existing = self.variable_columns.get(receiver)
+                if existing and existing[0] != "__all_except__":
+                    self.variable_columns[receiver] = [
+                        column for column in existing if column not in set(columns)
+                    ]
 
     def process(self, code, cell=None):
+        self.flow["code_units"].append({"cell": cell, "code": code})
         try:
             tree = ast.parse(code)
         except SyntaxError:
             return
+        for loop in (item for item in ast.walk(tree) if isinstance(item, ast.For)):
+            if not isinstance(loop.target, ast.Name) or not isinstance(loop.iter, (ast.List, ast.Tuple)):
+                continue
+            candidates = []
+            for element in loop.iter.elts:
+                if isinstance(element, ast.Call):
+                    candidate = _call_name(element).split(".")[-1]
+                    if candidate:
+                        candidates.append(candidate)
+            if candidates:
+                self.possible_object_types[loop.target.id] = list(dict.fromkeys(candidates))
+                self.flow["definitions"].setdefault(loop.target.id, []).append(
+                    _event_location(loop, self.flow["file"], cell)
+                )
         parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
-        assignments = [
-            node for node in ast.walk(tree) if isinstance(node, (ast.Assign, ast.AnnAssign))
+        # Process assignments and calls in source order.  Assignment gets
+        # priority on the same line so constructor/receiver metadata exists
+        # before the nested call is classified; duplicate row operations are
+        # suppressed by their original location.
+        nodes = [
+            node for node in ast.walk(tree)
+            if isinstance(node, (ast.Assign, ast.AnnAssign, ast.Call))
         ]
-        for node in sorted(assignments, key=lambda item: (item.lineno, item.col_offset)):
-            self._record_assignment(node, cell)
-        calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)]
-        for call in sorted(calls, key=lambda item: (item.lineno, item.col_offset)):
-            self._record_call(call, cell, parents)
+        for node in sorted(
+            nodes,
+            key=lambda item: (
+                item.lineno, item.col_offset,
+                0 if isinstance(item, (ast.Assign, ast.AnnAssign)) else 1,
+            ),
+        ):
+            if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                self._record_assignment(node, cell)
+            else:
+                self._record_call(node, cell, parents)
 
     def finish(self):
         flow = self.flow
         flow["variable_columns"] = deepcopy(self.variable_columns)
         flow["object_types"] = deepcopy(self.object_types)
         flow["constructor_inputs"] = deepcopy(self.constructor_inputs)
+        flow["possible_object_types"] = deepcopy(self.possible_object_types)
         matrix = flow.get("split", {}).get("input_features") or flow.get("feature_matrix")
         if matrix and matrix in self.variable_columns:
             selected = self.variable_columns[matrix]
@@ -512,6 +958,13 @@ class _FlowBuilder:
                 constructors.append({"variable": variable, "type": constructor})
         flow["models"] = constructors
         split = flow["split"]
+        if split.get("method") == "slice":
+            has_train = bool(split.get("split_roles", {}).get("train"))
+            has_holdout = bool(
+                split.get("split_roles", {}).get("validation")
+                or split.get("split_roles", {}).get("test")
+            )
+            split["detected"] = has_train and has_holdout
         roles = {
             role: {
                 "variables": list(split.get("split_roles", {}).get(role, [])),
@@ -520,17 +973,44 @@ class _FlowBuilder:
             for role in ("train", "validation", "test")
         }
         risks = []
-        test_selection = [use for use in roles["test"]["uses"] if use.get("purpose") == "hyperparameter comparison"]
+        test_selection = [use for use in roles["test"]["uses"] if use.get("purpose") == "test selection"]
         if test_selection:
+            selection_types = {use.get("selection_type") for use in test_selection}
+            if selection_types == {"model_comparison"}:
+                risk_type = "Test-set Used for Model Comparison"
+                verification = "Confirmed by distinct estimator constructors in the evaluation loop"
+                selection_type = "model_comparison"
+            elif selection_types == {"hyperparameter_search"}:
+                risk_type = "Test-set Used for Hyperparameter Comparison"
+                verification = "Confirmed by loop variables passed to estimator parameters"
+                selection_type = "hyperparameter_search"
+            else:
+                risk_type = "Repeated Test-set Evaluation Requires Review"
+                verification = "Repeated use confirmed; comparison semantics require review"
+                selection_type = "unknown"
             risks.append({
                 "rule_id": "CODE_TEST_SET_OVERUSE",
-                "type": "Test-set Overuse / Model Selection Leakage",
-                "severity": "High",
+                "type": risk_type,
+                "severity": "High" if selection_type != "unknown" else "Medium",
+                "verification": verification,
+                "selection_type": selection_type,
                 "evidence": test_selection,
+            })
+        repeated_test_evaluation = [
+            use for use in roles["test"]["uses"]
+            if use.get("purpose") == "metric"
+        ]
+        if len(repeated_test_evaluation) > 1 and not test_selection:
+            risks.append({
+                "rule_id": "CODE_REPEATED_TEST_EVALUATION_RISK",
+                "type": "Repeated Test-set Evaluation Requires Review",
+                "severity": "Low",
+                "verification": "Manual confirmation required",
+                "evidence": repeated_test_evaluation,
             })
         validation_selection = [
             use for use in roles["validation"]["uses"]
-            if use.get("purpose") == "hyperparameter comparison"
+            if use.get("purpose") == "test selection"
         ]
         if validation_selection:
             risks.append({
@@ -702,11 +1182,16 @@ def enrich_model_features(flow, data_result):
                     "severity": "Medium" if estimated_test_rows < 20 else "Low",
                     "evidence": f"estimated_test_rows={estimated_test_rows}, test_ratio={test_ratio:.2%}",
                 })
+    if enriched.get("files"):
+        enriched["files"] = [
+            enrich_model_features({**candidate, "files": []}, data_result)
+            for candidate in enriched["files"]
+        ]
     return enriched
 
 
 def merge_data_flows(flows):
-    """Choose a primary complete flow while retaining every file-level flow."""
+    """Build a project view while retaining file-level replay boundaries."""
     candidates = list(flows or [])
     if not candidates:
         return {**_empty_flow(), "files": []}
@@ -721,8 +1206,426 @@ def merge_data_flows(flows):
         )
 
     primary = deepcopy(max(candidates, key=score))
-    primary["files"] = candidates
+    primary["files"] = deepcopy(candidates)
+    for key in ("source_data", "preprocessing", "models", "fit", "predict", "metrics"):
+        primary[key] = [deepcopy(item) for flow in candidates for item in flow.get(key, [])]
+    primary["evaluation_detected"] = any(flow.get("evaluation_detected") for flow in candidates)
+
+    roles = {role: {"variables": [], "uses": []} for role in ("train", "validation", "test")}
+    risks = []
+    for flow in candidates:
+        analysis = flow.get("split_role_analysis", {})
+        for role in roles:
+            details = analysis.get("split_roles", {}).get(role, {})
+            roles[role]["variables"].extend(details.get("variables", []))
+            roles[role]["uses"].extend(details.get("uses", []))
+        risks.extend(analysis.get("risks", []))
+    for role in roles:
+        roles[role]["variables"] = list(dict.fromkeys(roles[role]["variables"]))
+    repeated_test_evaluation = [
+        use for use in roles["test"]["uses"]
+        if use.get("purpose") == "metric"
+    ]
+    if (
+        len(repeated_test_evaluation) > 1
+        and not any(risk.get("rule_id") == "CODE_TEST_SET_OVERUSE" for risk in risks)
+    ):
+        risks.append({
+            "rule_id": "CODE_REPEATED_TEST_EVALUATION_RISK",
+            "type": "Repeated Test-set Evaluation Requires Review",
+            "severity": "Low",
+            "verification": "Manual confirmation required",
+            "evidence": repeated_test_evaluation,
+        })
+    primary["split_role_analysis"] = {
+        "train_detected": bool(roles["train"]["variables"]),
+        "validation_detected": bool(roles["validation"]["variables"]),
+        "test_detected": bool(roles["test"]["variables"]),
+        "split_roles": roles,
+        "risks": risks,
+    }
+    primary["split"]["detected"] = any(
+        flow.get("split", {}).get("detected") for flow in candidates
+    )
+
+    fairness = primary.get("fairness", {})
+    for key in ("dataset_metrics", "prediction_metrics", "mitigations"):
+        fairness[key] = [
+            deepcopy(item) for flow in candidates
+            for item in flow.get("fairness", {}).get(key, [])
+        ]
+    fairness["evaluation_exists"] = bool(
+        fairness["dataset_metrics"] or fairness["prediction_metrics"]
+    )
+    fairness["before_after_comparison"] = any(
+        flow.get("fairness", {}).get("before_after_comparison") for flow in candidates
+    )
+    primary["fairness"] = fairness
+
+    labels = list(dict.fromkeys(
+        item.get("label") for item in primary["metrics"] if item.get("label")
+    ))
+    families = {item.get("family") for item in primary["metrics"]}
+    task = (
+        "Classification" if families == {"Classification"} else
+        "Regression" if families == {"Regression"} else
+        primary.get("task_type", {}).get("type", "Unknown")
+    )
+    if not labels:
+        coverage, suggested = (
+            "No explicit metric detected" if primary["fit"] else "Unable to verify", []
+        )
+    elif task == "Classification" and set(labels) == {"accuracy"}:
+        coverage, suggested = "Metric Coverage Limited", ["precision", "recall", "f1"]
+    elif task == "Regression" and len(labels) == 1:
+        coverage = "Metric Coverage Limited"
+        suggested = [item for item in ("rmse", "r2", "mae") if item not in labels]
+    else:
+        coverage, suggested = "Evaluation detected", []
+    primary["task_type"] = {
+        "type": task,
+        "confidence": "High" if families else primary.get("task_type", {}).get("confidence", "Low"),
+        "evidence": list(dict.fromkeys(
+            item for flow in candidates for item in flow.get("task_type", {}).get("evidence", [])
+        )),
+    }
+    primary["metric_coverage"] = {
+        "status": coverage, "detected": labels, "suggested": suggested,
+    }
     return primary
+
+
+def _flow_for_dataset(flow, csv_path):
+    """Select the file-level lineage that most clearly reads ``csv_path``."""
+    candidates = list((flow or {}).get("files") or [flow or {}])
+    wanted = Path(csv_path).name.casefold()
+
+    def score(candidate):
+        paths = [source.get("path") for source in candidate.get("source_data", [])]
+        matches = sum(
+            Path(str(path)).name.casefold() == wanted
+            for path in paths if isinstance(path, str)
+        )
+        return (
+            20 * matches
+            + 4 * bool(candidate.get("split", {}).get("detected"))
+            + 2 * bool(candidate.get("operations"))
+            + 2 * bool(candidate.get("model_features") or candidate.get("selected_features"))
+            + bool(candidate.get("target"))
+        )
+
+    return max(candidates, key=score) if candidates else (flow or {})
+
+
+def _replay_selector(spec):
+    spec = spec or {}
+    if not spec.get("reconstructable"):
+        raise ValueError(f"selector is not reconstructable: {spec.get('value')}")
+    if spec.get("kind") == "slice":
+        return slice(spec.get("start"), spec.get("stop"), spec.get("step"))
+    return spec.get("value")
+
+
+def reconstruct_modeling_data(flow, csv_path, data_result=None):
+    """Safely replay supported dataframe lineage and recover split membership.
+
+    This executes no project code.  It only applies AST-recorded loads,
+    aliases, column selections, column drops, row removals and literal slices
+    to a private dataframe copy.
+    """
+    from data_analyzer import read_csv_for_analysis
+
+    selected_flow = _flow_for_dataset(flow, csv_path)
+    base = {
+        "status": "Unable to reconstruct",
+        "reason": None,
+        "source_csv": Path(csv_path).name,
+        "source_variable": None,
+        "raw_rows": None,
+        "cleaned_rows": None,
+        "model_input_variable": None,
+        "model_input_columns": [],
+        "field_reconstruction": "Exact",
+        "unresolved_field_operations": [],
+        "target_column": (selected_flow.get("target") or {}).get("column"),
+        "train_indices": [],
+        "test_indices": [],
+        "train_rows": None,
+        "test_rows": None,
+        "evidence_level": "Unable to verify",
+        "operation_impacts": [],
+        "flow_file": selected_flow.get("file"),
+    }
+    try:
+        original = read_csv_for_analysis(csv_path)
+    except Exception as exc:
+        return {**base, "reason": f"CSV read failed: {exc}"}
+    base["raw_rows"] = len(original)
+    frames = {}
+    replay_steps = list(selected_flow.get("replay_steps", []))
+    wanted = Path(csv_path).name.casefold()
+    matched_load = False
+    split_line = (selected_flow.get("split") or {}).get("line")
+    split_cell = (selected_flow.get("split") or {}).get("cell")
+
+    for step in replay_steps:
+        operation = step.get("operation")
+        input_name = step.get("input")
+        output_name = step.get("output")
+        step_before_split = (
+            split_cell is None and (split_line is None or (step.get("line") or 0) <= split_line)
+        ) or (
+            split_cell is not None
+            and step.get("cell") is not None
+            and (
+                step.get("cell") < split_cell
+                or (
+                    step.get("cell") == split_cell
+                    and (step.get("line") or 0) <= (split_line or 0)
+                )
+            )
+        )
+        if operation == "unsupported" and step_before_split:
+            return {
+                **base,
+                "reason": (
+                    f"cannot safely replay {step.get('output')}: {step.get('expression')} "
+                    f"({step.get('reason')})"
+                ),
+            }
+        if operation == "load":
+            source_path = step.get("path")
+            if source_path is None or Path(str(source_path)).name.casefold() == wanted:
+                frames[output_name] = original.copy()
+                matched_load = True
+                base["source_variable"] = output_name
+            continue
+        if operation == "assign":
+            if input_name in frames:
+                frames[output_name] = frames[input_name].copy()
+            continue
+        if operation == "set_column":
+            source = frames.get(input_name)
+            if source is not None:
+                updated = source.copy()
+                if step.get("reconstructable"):
+                    updated[step.get("column")] = step.get("value")
+                else:
+                    # Preserve row membership and column position without
+                    # pretending the derived feature values are known.
+                    updated[step.get("column")] = 0
+                    base["field_reconstruction"] = "Partial"
+                    base["unresolved_field_operations"].append({
+                        "column": step.get("column"),
+                        "expression": step.get("expression"),
+                        "line": step.get("line"), "cell": step.get("cell"),
+                    })
+                frames[output_name] = updated
+            continue
+        if operation == "get_dummies":
+            source = frames.get(input_name)
+            if source is not None:
+                columns = step.get("columns")
+                frames[output_name] = pd.get_dummies(
+                    source,
+                    columns=columns,
+                    drop_first=bool(step.get("drop_first")),
+                    dummy_na=bool(step.get("dummy_na")),
+                )
+            continue
+        if operation == "column_selection":
+            source = frames.get(input_name)
+            columns = list(step.get("columns") or [])
+            if source is not None and all(column in source.columns for column in columns):
+                frames[output_name] = source[columns].copy()
+            continue
+        if operation == "drop_columns":
+            source = frames.get(input_name)
+            columns = list(step.get("columns") or [])
+            if source is not None and all(column in source.columns for column in columns):
+                frames[output_name] = source.drop(columns=columns).copy()
+            continue
+        if operation in {"dropna", "drop_duplicates"}:
+            source = frames.get(input_name)
+            if source is None:
+                continue
+            input_columns = list(step.get("input_columns") or [])
+            if input_columns:
+                if not all(column in source.columns for column in input_columns):
+                    base["operation_impacts"].append({
+                        "operation": operation,
+                        "quantification": "Unable to quantify",
+                        "reason": f"selected columns not present on {input_name}: {input_columns}",
+                        "line": step.get("line"), "cell": step.get("cell"),
+                    })
+                    continue
+                source = source[input_columns].copy()
+            subset = list(step.get("subset") or [])
+            missing = [column for column in subset if column not in source.columns]
+            if missing:
+                base["operation_impacts"].append({
+                    "operation": operation,
+                    "quantification": "Unable to quantify",
+                    "reason": f"subset columns not present on {input_name}: {missing}",
+                    "line": step.get("line"), "cell": step.get("cell"),
+                })
+                continue
+            before = len(source)
+            cleaned = (
+                source.dropna(subset=subset or None)
+                if operation == "dropna" else
+                source.drop_duplicates(subset=subset or None)
+            )
+            affected = (
+                [column for column in (subset or list(source.columns)) if source[column].isna().any()]
+                if operation == "dropna" else list(subset or source.columns)
+            )
+            model_columns = set(selected_flow.get("model_features", []))
+            target = (selected_flow.get("target") or {}).get("column")
+            if target:
+                model_columns.add(target)
+            removed_index = source.index.difference(cleaned.index)
+            base["operation_impacts"].append({
+                "operation": operation,
+                "quantification": "Exact",
+                "evidence_level": "Verified from imported data + reconstructed operation",
+                "calculation_scope": (
+                    f"{input_name} columns={list(source.columns)}; operation={operation}; "
+                    f"subset={subset or list(source.columns)}"
+                ),
+                "before": before,
+                "after": len(cleaned),
+                "removed": before - len(cleaned),
+                "removal_rate": (before - len(cleaned)) / before if before else 0.0,
+                "affected_columns": affected,
+                "relevant_columns": [column for column in affected if column in model_columns],
+                "non_model_columns": [column for column in affected if column not in model_columns],
+                "sample_removed_rows": [
+                    int(index) if isinstance(index, int) else str(index)
+                    for index in removed_index[:10]
+                ],
+                "line": step.get("line"), "cell": step.get("cell"),
+            })
+            destination = output_name or (input_name if step.get("inplace") else None)
+            if destination:
+                frames[destination] = cleaned.copy()
+            continue
+        if operation == "row_slice":
+            source = frames.get(input_name)
+            spec = step.get("slice") or {}
+            if source is not None and spec.get("reconstructable"):
+                frames[output_name] = source.iloc[
+                    slice(spec.get("start"), spec.get("stop"), spec.get("step"))
+                ].copy()
+            continue
+        if operation in {"iloc_selection", "loc_selection"}:
+            source = frames.get(input_name)
+            if source is None:
+                continue
+            try:
+                rows = _replay_selector(step.get("row_selector"))
+                columns = _replay_selector(step.get("column_selector"))
+                accessor = source.iloc if operation == "iloc_selection" else source.loc
+                selected = accessor[rows, columns]
+                frames[output_name] = selected.copy()
+            except Exception as exc:
+                return {
+                    **base,
+                    "reason": f"cannot replay {operation} for {output_name}: {exc}",
+                }
+
+    # Tests and direct API users may provide only the transformations, with
+    # the CSV passed separately.  Bind one unambiguous external dataframe root
+    # to that explicit input, then replay from the beginning.
+    if not matched_load:
+        referenced = [
+            step.get("input") for step in replay_steps
+            if step.get("input") and step.get("input") not in frames
+        ]
+        roots = [
+            name for name in dict.fromkeys(referenced)
+            if isinstance(name, str) and name.isidentifier()
+        ]
+        root = roots[0] if len(roots) == 1 else ("df" if "df" in roots else None)
+        if root:
+            rebound = deepcopy(selected_flow)
+            rebound["source_data"] = [{"variable": root, "path": str(csv_path)}]
+            rebound["replay_steps"] = [
+                {"order": 0, "operation": "load", "output": root, "path": str(csv_path)},
+                *replay_steps,
+            ]
+            return reconstruct_modeling_data({"files": [rebound]}, csv_path, data_result)
+
+    split = selected_flow.get("split", {})
+    model_variable = split.get("input_features") or selected_flow.get("feature_matrix")
+    model_frame = frames.get(model_variable)
+    if isinstance(model_frame, pd.Series):
+        model_frame = model_frame.to_frame()
+    if model_frame is None:
+        return {**base, "reason": f"model input variable {model_variable or '?'} could not be replayed"}
+    base["model_input_variable"] = model_variable
+    base["model_input_columns"] = list(model_frame.columns)
+    base["cleaned_rows"] = len(model_frame)
+
+    method = split.get("method") or ("train_test_split" if split.get("calls") else None)
+    try:
+        if method == "train_test_split":
+            if split.get("random_state") is None:
+                return {**base, "reason": "train_test_split random_state is unknown"}
+            from sklearn.model_selection import train_test_split
+
+            indices = list(model_frame.index)
+            stratify = None
+            if split.get("stratify"):
+                target_variable = split.get("input_target")
+                target_values = frames.get(target_variable)
+                if isinstance(target_values, pd.DataFrame) and target_values.shape[1] == 1:
+                    target_values = target_values.iloc[:, 0]
+                if isinstance(target_values, pd.Series):
+                    stratify = target_values.loc[indices]
+                elif base.get("target_column") in original.columns:
+                    stratify = original.loc[indices, base["target_column"]]
+                else:
+                    return {
+                        **base,
+                        "reason": f"stratify expression {split.get('stratify')} could not be replayed",
+                    }
+            train_index, test_index = train_test_split(
+                indices,
+                test_size=split.get("test_size") if split.get("test_size") is not None else 0.25,
+                random_state=split.get("random_state"),
+                stratify=stratify,
+            )
+        elif method == "slice":
+            train_names = split.get("split_roles", {}).get("train", [])
+            test_names = split.get("split_roles", {}).get("test", [])
+            train_objects = [frames[name] for name in train_names if name in frames]
+            test_objects = [frames[name] for name in test_names if name in frames]
+            if not train_objects or not test_objects:
+                return {
+                    **base,
+                    "reason": "train/test slice bounds or source variables could not be replayed",
+                }
+            train_index = list(train_objects[0].index)
+            test_index = list(test_objects[0].index)
+        else:
+            return {
+                **base,
+                "reason": f"split method {method or '?'} is not safely reconstructable",
+            }
+    except Exception as exc:
+        return {**base, "reason": f"split replay failed: {exc}"}
+    return {
+        **base,
+        "status": "Exact",
+        "evidence_level": "Verified from imported data + reconstructed operation",
+        "reason": None,
+        "train_indices": [int(value) if isinstance(value, int) else value for value in train_index],
+        "test_indices": [int(value) if isinstance(value, int) else value for value in test_index],
+        "train_rows": len(train_index),
+        "test_rows": len(test_index),
+        "model_input_frame": model_frame,
+    }
 
 
 def quantify_data_impacts(flow, csv_path, data_result=None):
@@ -732,6 +1635,25 @@ def quantify_data_impacts(flow, csv_path, data_result=None):
     operations = list((flow or {}).get("operations", []))
     if not operations:
         return []
+    reconstruction = reconstruct_modeling_data(flow, csv_path, data_result)
+    replayed = list(reconstruction.get("operation_impacts", []))
+    if replayed:
+        return replayed
+    return [{
+        "operation": operation.get("type"),
+        "quantification": "Unable to quantify",
+        "reason": reconstruction.get("reason") or "operation lineage could not be replayed",
+        "before": None,
+        "after": None,
+        "removed": None,
+        "removal_rate": None,
+        "relevant_columns": [],
+        "line": operation.get("line"),
+        "cell": operation.get("cell"),
+    } for operation in operations]
+
+    # Legacy fallback retained below for third-party callers pinned to older
+    # flow dictionaries; canonical flows always return above.
     try:
         original = read_csv_for_analysis(csv_path)
     except Exception as exc:
@@ -848,6 +1770,12 @@ def reconcile_code_issues_with_flow(code_result, data_flow):
     split_detected = bool(flow.get("split", {}).get("detected"))
     evaluation_detected = bool(flow.get("evaluation_detected"))
     metrics_detected = bool(flow.get("metrics"))
+    metric_labels = {item.get("label") for item in flow.get("metrics", []) if item.get("label")}
+    holdout_evaluation = any(
+        any(marker in str(event.get(key, "")).casefold() for marker in ("test", "val", "valid"))
+        for event in [*flow.get("predict", []), *flow.get("metrics", [])]
+        for key in ("X", "target", "prediction")
+    )
     reconciled = []
     for location in code_result or []:
         issues = []
@@ -856,6 +1784,12 @@ def reconcile_code_issues_with_flow(code_result, data_flow):
             if split_detected and rule_id == "CODE_NO_VALIDATION_SPLIT":
                 continue
             if (evaluation_detected or metrics_detected) and rule_id == "CODE_NO_EVALUATION":
+                continue
+            if holdout_evaluation and rule_id == "CODE_TRAINING_ONLY_EVALUATION":
+                continue
+            if len(metric_labels) > 1 and rule_id in {
+                "CODE_SINGLE_CLASSIFICATION_METRIC", "CODE_SINGLE_REGRESSION_METRIC",
+            }:
                 continue
             issues.append(issue)
         if issues:

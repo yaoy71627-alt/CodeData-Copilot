@@ -109,6 +109,59 @@ def _compact_project_context(project_context):
     return serialized[:MAX_PROJECT_CONTEXT_CHARS] + "\n…（项目上下文已截断）"
 
 
+def _repair_generation_context(data_flow, location, issue):
+    candidates = list((data_flow or {}).get("files") or [data_flow or {}])
+    flow = next(
+        (item for item in candidates if item.get("file") == location.get("file")),
+        data_flow or {},
+    )
+    cell = location.get("cell")
+    line = issue.get("line")
+    units = [
+        unit for unit in flow.get("code_units", [])
+        if cell is None or unit.get("cell") == cell
+    ]
+    available = []
+    for name, definitions in (flow.get("definitions") or {}).items():
+        if any(
+            (
+                cell is None
+                and definition.get("cell") is None
+                and (line is None or (definition.get("line") or 0) < line)
+            )
+            or (
+                cell is not None
+                and definition.get("cell") is not None
+                and (
+                    definition.get("cell") < cell
+                    or (
+                        definition.get("cell") == cell
+                        and (line is None or (definition.get("line") or 0) < line)
+                    )
+                )
+            )
+            for definition in definitions
+        ):
+            available.append(name)
+    return {
+        "file": location.get("file"),
+        "cell": cell,
+        "line": line,
+        "surrounding_cell_code": units[0].get("code") if units else None,
+        "upstream_definitions": sorted(available),
+        "downstream_usages": [
+            item for item in flow.get("lineage", [])
+            if item.get("from") in available or item.get("to") in available
+        ],
+        "available_variables": sorted(available),
+        "model_features": list(flow.get("model_features", [])),
+        "target": flow.get("target"),
+        "split_state": flow.get("split"),
+        "existing_preprocessing": flow.get("preprocessing", []),
+        "candidate_model_types": flow.get("possible_object_types", {}),
+    }
+
+
 def build_repair_suggestions(code_result, data_flow=None, data_results=None):
     """Offline examples for known rules; never edit the analyzed project."""
     examples = {
@@ -126,6 +179,18 @@ def build_repair_suggestions(code_result, data_flow=None, data_results=None):
             "直接删除缺失记录可能损失样本；先评估缺失机制和比例。",
             "imputer = SimpleImputer(strategy='median')\n"
             "X_train = imputer.fit_transform(X_train)\nX_test = imputer.transform(X_test)"
+        ),
+        "Test-set Used for Model Comparison": (
+            "使用独立验证集选择候选模型，仅在方案锁定后使用测试集。",
+            None,
+        ),
+        "Test-set Used for Hyperparameter Comparison": (
+            "针对每个 estimator 分别定义合法参数空间，并在验证集或交叉验证中选择配置。",
+            None,
+        ),
+        "Repeated Test-set Evaluation Requires Review": (
+            "静态证据不足以生成安全 Patch；请先明确循环中的比较对象并保留独立最终测试集。",
+            None,
         ),
     }
     suggestions = []
@@ -145,6 +210,7 @@ def build_repair_suggestions(code_result, data_flow=None, data_results=None):
             kind = issue.get("type")
             if kind in examples:
                 reason, corrected = examples[kind]
+                conceptual_code = corrected
                 original = issue.get("source_snippet")
                 referenced_columns = []
                 scope = None
@@ -169,18 +235,33 @@ def build_repair_suggestions(code_result, data_flow=None, data_results=None):
                     else:
                         corrected = None
                         reason = "无法在当前执行位置确认可安全填补的模型字段，仅保留人工建议。"
+                elif kind in {"Data Leakage Risk", "Potential Data Leakage"}:
+                    corrected = None
+                    reason = (
+                        "该问题需要同时调整划分、变换器拟合和后续变量引用；"
+                        "单行替换无法保证下游兼容，因此降级为 Recommendation Only。"
+                    )
+                elif not original:
+                    corrected = None
+                    reason = "缺少可逐字定位的原始代码，仅保留 Recommendation Only。"
+                generation_context = _repair_generation_context(data_flow, location, issue)
                 suggestions.append({
                     "location": label,
+                    "file": location.get("file"),
+                    "cell": location.get("cell"),
+                    "line": issue.get("line"),
                     "problem": kind,
                     "reason": reason,
                     "original_code": original,
                     "corrected_code": corrected,
                     "before_code": original,
                     "after_code": corrected,
+                    "conceptual_code": conceptual_code if corrected is None else None,
                     "explanation": reason,
                     "requires_confirmation": True,
                     "referenced_columns": referenced_columns,
                     "scope": scope,
+                    "repair_context": generation_context,
                 })
     return suggestions
 
@@ -286,7 +367,13 @@ def run_agent(
 
 你不得自行猜测或编造：行数、列名、模型变量、训练/测试状态、评价指标、业务规则、删除比例。
 这些事实只能引用“Analyzer 已验证的结构化事实”。如果 Analyzer 未验证，必须写：Unable to verify automatically.
-不得生成与 detected_split、detected_metrics、model_features、quantified_impacts 或 formal issues 冲突的结论。"""
+不得生成与 detected_split、detected_metrics、model_features、quantified_impacts 或 formal issues 冲突的结论。
+
+影响表述必须与证据强度一致：只有 runtime 或定量对照证据才能使用“严重高估、显著提升、显著降低、严重降低、大幅偏差”等程度词；
+仅有静态泄漏风险时，只能说“可能导致评价结果产生乐观偏差”。
+不得自行创造“救命场景、医疗风险、金融风险、业务损失”等背景。
+若项目没有明确记录分类错误代价，应写“若业务更关注正类漏判，可重点关注 recall；具体指标优先级需结合任务目标确定”。
+无法验证的边界集中放在 Verification Limitations 中；同一限制不要在各段重复。"""
     prompt += """
 
 公平性 API 约束：不得自行创造方法名或把不同 metric class 的方法混用。

@@ -554,24 +554,45 @@ def _legacy_duplicate_split_analysis(df, row_hashes, data_flow):
         return {**base, "reason": f"划分重建失败：{exc}"}
 
 
-def _duplicate_scope(df, fields, train_indices, test_indices, *, semantic_source):
+def _duplicate_scope(
+    df, fields, train_indices, test_indices, *, semantic_source, duplicate_kind,
+):
     """Calculate one explicitly labelled duplicate scope."""
-    fields = [field for field in fields if field in df.columns]
-    if not fields:
+    requested_fields = list(dict.fromkeys(fields or []))
+    missing_fields = [field for field in requested_fields if field not in df.columns]
+    if not requested_fields or missing_fields:
         return {
-            "status": "Unable to quantify", "fields": [], "duplicate_groups": None,
+            "status": "Unable to quantify", "fields": requested_fields,
+            "missing_fields": missing_fields, "duplicate_groups": None,
             "cross_split_duplicate_groups": None, "shared_records": None,
-            "sample_rows": [], "reason": "No verified fields were available for this scope.",
-            "semantic_source": semantic_source,
+            "sample_rows": [],
+            "reason": (
+                f"Required fields are unavailable: {missing_fields}"
+                if missing_fields else "No verified fields were available for this scope."
+            ),
+            "semantic_source": semantic_source, "duplicate_kind": duplicate_kind,
         }
-    hashes = pd.util.hash_pandas_object(df[fields], index=False)
+    relevant_indices = list(dict.fromkeys([*train_indices, *test_indices]))
+    unavailable_indices = [index for index in relevant_indices if index not in df.index]
+    if unavailable_indices:
+        return {
+            "status": "Unable to quantify", "fields": requested_fields,
+            "missing_fields": [], "duplicate_groups": None,
+            "cross_split_duplicate_groups": None, "shared_records": None,
+            "sample_rows": [],
+            "reason": "Reconstructed split indices are unavailable in the comparison frame.",
+            "semantic_source": semantic_source, "duplicate_kind": duplicate_kind,
+        }
+    comparison = df.loc[relevant_indices, requested_fields]
+    hashes = pd.util.hash_pandas_object(comparison, index=False)
     train_counts = hashes.loc[train_indices].value_counts()
     test_counts = hashes.loc[test_indices].value_counts()
     shared = set(train_counts.index) & set(test_counts.index)
     rows = [int(index) for index, value in hashes.items() if value in shared]
     return {
         "status": "Exact",
-        "fields": fields,
+        "fields": requested_fields,
+        "missing_fields": [],
         "duplicate_groups": int(hashes.value_counts().gt(1).sum()),
         "cross_split_duplicate_groups": len(shared),
         "shared_records": sum(
@@ -580,33 +601,101 @@ def _duplicate_scope(df, fields, train_indices, test_indices, *, semantic_source
         "sample_rows": rows[:20],
         "reason": None,
         "semantic_source": semantic_source,
+        "duplicate_kind": duplicate_kind,
     }
+
+
+def _identifier_name_profile(column):
+    """Classify identifier semantics, including CamelCase and acronym suffixes."""
+    text = str(column)
+    separated = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", text)
+    separated = re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", "_", separated)
+    normalized = re.sub(r"[^a-z0-9]+", "_", separated.casefold()).strip("_")
+    tokens = [token for token in normalized.split("_") if token]
+    if not tokens or tokens[0] in {"unnamed", "index", "row"}:
+        return {"strength": None, "normalized": normalized, "tokens": tokens}
+    strong_suffix = tokens[-1] in {"id", "identifier", "key"}
+    weak_semantic = bool(
+        set(tokens) & {"ticket", "code", "reference", "ref"}
+        or tokens[-1] in {"number", "no"}
+    )
+    strength = "strong" if strong_suffix else "weak" if weak_semantic else None
+    return {"strength": strength, "normalized": normalized, "tokens": tokens}
 
 
 def _business_id_candidates(df, explicit_columns=None):
     explicit = [column for column in (explicit_columns or []) if column in df.columns]
     if explicit:
-        return [explicit], "Explicit business constraint"
-    candidates = []
+        return [explicit], [{
+            "fields": explicit,
+            "status": "Verified",
+            "confidence": "High",
+            "semantic_source": "Explicit business constraint",
+            "reason": "Configured through business_id_columns.",
+        }]
+    candidate_hints = []
     for column in df.columns:
-        normalized = re.sub(r"[^a-z0-9]+", "_", str(column).casefold()).strip("_")
-        tokens = set(normalized.split("_"))
-        identifier_name = bool(
-            tokens & {"id", "identifier", "key", "ticket", "name"}
-            or normalized.endswith(("_id", "id", "_number", "number", "_no"))
+        name_profile = _identifier_name_profile(column)
+        if not name_profile["strength"]:
+            continue
+        non_null_count = int(df[column].notna().sum())
+        unique_count = int(df[column].nunique(dropna=True))
+        unique_ratio = unique_count / non_null_count if non_null_count else 0.0
+        missing_rate = 1 - (non_null_count / len(df)) if len(df) else 1.0
+        # A semantic suffix alone is insufficient.  Constant, very low-cardinality
+        # and heavily missing fields are not promoted to identifier candidates.
+        if unique_count <= 1 or unique_ratio < 0.10 or missing_rate > 0.20:
+            continue
+        confidence = (
+            "High"
+            if name_profile["strength"] == "strong"
+            and unique_ratio >= 0.80 and missing_rate <= 0.05
+            else "Medium"
         )
-        if identifier_name and 1 < df[column].nunique(dropna=True) < len(df):
-            candidates.append([column])
-    return candidates, "Inferred from identifier-like field name; business semantics require confirmation"
+        candidate_hints.append({
+            "fields": [column],
+            "status": "Candidate",
+            "confidence": confidence,
+            "semantic_source": "Identifier semantics + observed value distribution",
+            "reason": (
+                "The column name and distribution are consistent with an identifier, "
+                "but business-key semantics have not been explicitly confirmed."
+            ),
+            "name_strength": name_profile["strength"],
+            "normalized_name": name_profile["normalized"],
+            "unique_values": unique_count,
+            "unique_ratio": unique_ratio,
+            "missing_rate": missing_rate,
+        })
+    return [], candidate_hints
+
+
+def _candidate_identifier_priority(scope):
+    """Rank identifier evidence without treating observed overlap as identity proof."""
+    distribution = scope.get("distribution") or {}
+    unique_ratio = distribution.get("unique_ratio")
+    missing_rate = distribution.get("missing_rate")
+    return (
+        {"High": 2, "Medium": 1, "Low": 0}.get(
+            scope.get("candidate_confidence"), -1,
+        ),
+        {"strong": 2, "weak": 1}.get(scope.get("name_strength"), 0),
+        float(unique_ratio) if unique_ratio is not None else -1.0,
+        -float(missing_rate) if missing_rate is not None else -1.0,
+    )
 
 
 def _duplicate_split_analysis(
     df, row_hashes, data_flow, csv_path=None, business_id_columns=None,
 ):
     """Reconstruct modeling rows first, then calculate named duplicate scopes."""
+    verified_business_ids, business_id_candidates = _business_id_candidates(
+        df, business_id_columns,
+    )
     base = {
         "status": "Unable to quantify",
         "scope": None,
+        "duplicate_kind": None,
         "fields": [],
         "duplicate_groups": int(row_hashes.value_counts().gt(1).sum()),
         "cross_split_duplicate_groups": None,
@@ -614,6 +703,7 @@ def _duplicate_split_analysis(
         "sample_rows": [],
         "reason": None,
         "scopes": {},
+        "business_id_candidates": business_id_candidates,
         "modeling_data": {},
     }
     if not csv_path:
@@ -628,11 +718,16 @@ def _duplicate_split_analysis(
         key: reconstruction.get(key) for key in (
             "status", "reason", "source_csv", "source_variable", "raw_rows",
             "cleaned_rows", "model_input_variable", "model_input_columns",
+            "model_input_source_columns", "model_input_feature_lineage",
             "target_column", "flow_file", "field_reconstruction",
-            "unresolved_field_operations", "train_rows", "test_rows", "evidence_level",
+            "row_reconstruction", "unresolved_field_operations", "train_rows",
+            "test_rows", "evidence_level",
         )
     }
-    if reconstruction.get("status") != "Exact":
+    if not (
+        reconstruction.get("status") == "Exact"
+        or reconstruction.get("row_reconstruction") == "Exact"
+    ):
         return {
             **base,
             "reason": reconstruction.get("reason") or "Modeling rows could not be replayed.",
@@ -644,12 +739,21 @@ def _duplicate_split_analysis(
         "raw_full_row": _duplicate_scope(
             df, list(df.columns), train_indices, test_indices,
             semantic_source="All original CSV columns on rows that survived modeling cleanup",
+            duplicate_kind="full_row",
         ),
         "model_input_row": _duplicate_scope(
-            df, reconstruction.get("model_input_columns") or [], train_indices, test_indices,
-            semantic_source="Replayed model-input columns",
+            reconstruction.get("model_input_frame", pd.DataFrame()),
+            reconstruction.get("model_input_columns") or [], train_indices, test_indices,
+            semantic_source="Fully replayed post-preprocessing model-input matrix",
+            duplicate_kind="model_input_features",
         ),
     }
+    scopes["model_input_row"]["feature_lineage"] = reconstruction.get(
+        "model_input_feature_lineage", {}
+    )
+    scopes["model_input_row"]["source_columns"] = reconstruction.get(
+        "model_input_source_columns", []
+    )
     if reconstruction.get("field_reconstruction") != "Exact":
         scopes["model_input_row"] = {
             **scopes["model_input_row"],
@@ -659,20 +763,51 @@ def _duplicate_split_analysis(
             "shared_records": None,
             "reason": "One or more model-input field expressions could not be safely replayed.",
         }
-    candidate_groups, candidate_source = _business_id_candidates(df, business_id_columns)
     business_scopes = [
         _duplicate_scope(
-            df, fields, train_indices, test_indices, semantic_source=candidate_source,
+            df, fields, train_indices, test_indices,
+            semantic_source="Explicit business constraint",
+            duplicate_kind="entity_id",
         )
-        for fields in candidate_groups
+        for fields in verified_business_ids
     ]
     if business_scopes:
-        business_scope = max(
-            business_scopes,
-            key=lambda item: item.get("cross_split_duplicate_groups") or 0,
-        )
-        business_scope["candidates"] = business_scopes
+        business_scope = dict(max(
+            business_scopes, key=lambda item: item.get("cross_split_duplicate_groups") or 0,
+        ))
+        business_scope["candidates"] = [
+            dict(candidate) for candidate in business_scopes
+        ]
         scopes["business_id"] = business_scope
+
+    candidate_scopes = []
+    for candidate in business_id_candidates:
+        if candidate.get("status") != "Candidate":
+            continue
+        candidate_scope = _duplicate_scope(
+            df, candidate["fields"], train_indices, test_indices,
+            semantic_source=candidate["semantic_source"],
+            duplicate_kind="candidate_entity_id",
+        )
+        candidate_scope.update({
+            "candidate_status": candidate["status"],
+            "candidate_confidence": candidate["confidence"],
+            "candidate_reason": candidate["reason"],
+            "name_strength": candidate.get("name_strength"),
+            "normalized_name": candidate.get("normalized_name"),
+            "distribution": {
+                key: candidate.get(key)
+                for key in ("unique_values", "unique_ratio", "missing_rate")
+            },
+        })
+        candidate_scopes.append(candidate_scope)
+    if candidate_scopes:
+        candidate_scope = dict(max(
+            candidate_scopes,
+            key=_candidate_identifier_priority,
+        ))
+        candidate_scope["candidates"] = [dict(item) for item in candidate_scopes]
+        scopes["candidate_id"] = candidate_scope
 
     primary_name = "business_id" if "business_id" in scopes else "model_input_row"
     primary = scopes[primary_name]
@@ -680,6 +815,7 @@ def _duplicate_split_analysis(
         **base,
         "status": primary.get("status", "Unable to quantify"),
         "scope": primary_name,
+        "duplicate_kind": primary.get("duplicate_kind"),
         "fields": primary.get("fields", []),
         "duplicate_groups": primary.get("duplicate_groups"),
         "cross_split_duplicate_groups": primary.get("cross_split_duplicate_groups"),
@@ -688,6 +824,87 @@ def _duplicate_split_analysis(
         "reason": primary.get("reason"),
         "scopes": scopes,
     }
+
+
+def _append_cross_split_findings(issues, split_analysis, row_count):
+    """Emit scope-specific findings without conflating records and entities."""
+    scopes = split_analysis.get("scopes", {})
+    cleaned_rows = split_analysis.get("modeling_data", {}).get("cleaned_rows") or row_count
+    definitions = {
+        "raw_full_row": {
+            # Retain the established rule id only for its original, exact
+            # meaning: equal values across every original field.
+            "rule_id": "DQ_CROSS_SPLIT_DUPLICATES",
+            "type": "Cross-split Full-record Duplicates",
+            "severity": "High",
+            "confidence": "High",
+            "message": "Identical full records occur in both the reconstructed training and test sets.",
+            "recommendation": "Trace the source of the full-record duplicates and deduplicate before splitting when business rules permit.",
+            "issue_nature": "Confirmed Record Duplication",
+        },
+        "model_input_row": {
+            "rule_id": "DQ_CROSS_SPLIT_FEATURE_COMBINATIONS",
+            "type": "Repeated Model-input Feature Combinations Across Splits",
+            "severity": "Low",
+            "confidence": "Medium",
+            "message": (
+                "Identical model-input feature vectors occur in both splits. "
+                "This is repeated feature data, not proof of duplicate records or entities."
+            ),
+            "recommendation": "Review whether repeated feature combinations are expected; require a confirmed entity key before labeling them entity leakage.",
+            "issue_nature": "Feature Pattern Reuse",
+        },
+        "candidate_id": {
+            "rule_id": "DQ_CROSS_SPLIT_CANDIDATE_ID_OVERLAP",
+            "type": "Candidate Identifier Overlap Across Splits",
+            "severity": "Medium",
+            "confidence": "Medium",
+            "message": (
+                "A candidate identifier has values in both splits. This suggests "
+                "possible entity overlap, but the field is not a confirmed business key."
+            ),
+            "recommendation": "Confirm the identifier's business semantics, then group or split by the confirmed entity key if needed.",
+            "issue_nature": "Candidate Entity Overlap",
+        },
+        "business_id": {
+            "rule_id": "DQ_CROSS_SPLIT_ENTITY_ID_OVERLAP",
+            "type": "Confirmed Business-entity Overlap Across Splits",
+            "severity": "High",
+            "confidence": "High",
+            "message": "The explicitly confirmed business identifier has values in both training and test sets.",
+            "recommendation": "Use a group-aware split on the confirmed business identifier and reassess the evaluation.",
+            "issue_nature": "Confirmed Entity Overlap",
+        },
+    }
+    for scope_name, definition in definitions.items():
+        scope = scopes.get(scope_name, {})
+        if scope.get("status") != "Exact" or not scope.get("cross_split_duplicate_groups"):
+            continue
+        shared_records = scope.get("shared_records") or 0
+        issues.append(_issue(
+            definition["rule_id"], "Duplicates", definition["type"],
+            definition["severity"], definition["confidence"],
+            definition["message"], definition["recommendation"],
+            evidence=(
+                f"scope={scope_name}; fields={scope.get('fields', [])}; "
+                f"duplicate groups={scope.get('duplicate_groups')}; cross-split groups="
+                f"{scope.get('cross_split_duplicate_groups')}; shared rows={shared_records}; "
+                f"rows after cleanup={cleaned_rows}."
+            ),
+            count=shared_records,
+            rate=shared_records / max(1, cleaned_rows),
+            affected_rows=scope.get("sample_rows", []),
+            issue_origin="Reconstructed train/test split",
+            issue_nature=definition["issue_nature"],
+            action="Review",
+            duplicate_scope=scope_name,
+            duplicate_kind=scope.get("duplicate_kind"),
+            duplicate_fields=scope.get("fields", []),
+            calculation_scope=(
+                f"scope={scope_name}; fields={scope.get('fields', [])}; "
+                f"rows after cleanup={cleaned_rows}"
+            ),
+        ))
 
 
 def analyze_csv(csv_path, constraints=None, business_rules=None, data_flow=None):
@@ -929,37 +1146,7 @@ def analyze_csv(csv_path, constraints=None, business_rules=None, data_flow=None)
         business_id_columns=business_id_columns,
     )
     split_duplicates = result["duplicate_split_analysis"]
-    if split_duplicates.get("status") == "Exact" and split_duplicates.get("cross_split_duplicate_groups"):
-        issues.append(_issue(
-            "DQ_CROSS_SPLIT_DUPLICATES", "Duplicates", "Cross-split Duplicate Risk",
-            "Medium", "High",
-            "可重建划分中，相同记录同时出现在训练集与测试集。",
-            "在划分前按业务主键或完整记录审查重复来源；经确认后再去重。",
-            evidence=(
-                f"scope={split_duplicates.get('scope')}; "
-                f"fields={split_duplicates.get('fields', [])}; duplicate groups "
-                f"{split_duplicates.get('duplicate_groups')}；跨划分重复组 "
-                f"{split_duplicates['cross_split_duplicate_groups']}；共享记录 "
-                f"{split_duplicates['shared_records']}；"
-                f"rows after cleanup={split_duplicates.get('modeling_data', {}).get('cleaned_rows')}。"
-            ),
-            count=split_duplicates["shared_records"],
-            rate=(
-                split_duplicates["shared_records"]
-                / max(1, split_duplicates.get("modeling_data", {}).get("cleaned_rows") or rows)
-            ),
-            affected_rows=split_duplicates.get("sample_rows", []),
-            issue_origin="Reconstructed train_test_split",
-            issue_nature="Needs Review",
-            action="Review",
-            duplicate_scope=split_duplicates.get("scope"),
-            duplicate_fields=split_duplicates.get("fields", []),
-            calculation_scope=(
-                f"scope={split_duplicates.get('scope')}; "
-                f"fields={split_duplicates.get('fields', [])}; "
-                f"rows after cleanup={split_duplicates.get('modeling_data', {}).get('cleaned_rows')}"
-            ),
-        ))
+    _append_cross_split_findings(issues, split_duplicates, rows)
 
     _detect_identical_columns(df, issues)
     _detect_string_and_type_quality(

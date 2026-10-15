@@ -21,6 +21,7 @@ from data_flow_analyzer import (
     analyze_python_data_flow,
     merge_data_flows,
     reconcile_code_issues_with_flow,
+    reconstruct_modeling_data,
 )
 from github_loader import _scan_repository
 from notebook_syntax import preprocess_notebook_source
@@ -84,10 +85,91 @@ X_train, X_test, y_train, y_test = train_test_split(
     assert duplicate["status"] == "Exact"
     assert duplicate["modeling_data"]["raw_rows"] == 10
     assert duplicate["modeling_data"]["cleaned_rows"] == 8
-    assert duplicate["scope"] == "business_id"
-    assert duplicate["fields"] == ["Ticket"]
-    assert duplicate["cross_split_duplicate_groups"] == expected_business_overlap
+    assert duplicate["scope"] == "model_input_row"
+    assert "business_id" not in duplicate["scopes"]
+    assert duplicate["scopes"]["candidate_id"]["fields"] == ["Ticket"]
+    assert (
+        duplicate["scopes"]["candidate_id"]["cross_split_duplicate_groups"]
+        == expected_business_overlap
+    )
     assert duplicate["scopes"]["model_input_row"]["fields"] == ["feature"]
+
+
+def test_candidate_identifier_priority_uses_semantics_and_distribution_not_overlap():
+    row_count = 20
+    train_index, test_index = train_test_split(
+        list(range(row_count)), test_size=0.5, random_state=23,
+    )
+    entity_ids = [f"entity-{index}" for index in range(row_count)]
+    ticket_codes = [f"ticket-{index}" for index in range(row_count)]
+    entity_ids[test_index[0]] = entity_ids[train_index[0]]
+    for group, (train_row, test_row) in enumerate(zip(train_index[:5], test_index[:5])):
+        ticket_codes[train_row] = f"shared-{group}"
+        ticket_codes[test_row] = f"shared-{group}"
+    frame = pd.DataFrame({
+        "EntityId": entity_ids,
+        "TicketCode": ticket_codes,
+        "feature": range(row_count),
+        "label": [index % 2 for index in range(row_count)],
+    })
+    code = """
+X = df[["feature"]]
+y = df["label"]
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.5, random_state=23
+)
+"""
+    flow = analyze_python_data_flow(code)
+    with TemporaryDirectory() as directory:
+        path = Path(directory) / "records.csv"
+        frame.to_csv(path, index=False)
+        result = analyze_csv(path, data_flow=flow)
+
+    duplicate = result["duplicate_split_analysis"]
+    primary_candidate = duplicate["scopes"]["candidate_id"]
+    candidates = {
+        item["fields"][0]: item for item in primary_candidate["candidates"]
+    }
+
+    assert candidates["TicketCode"]["cross_split_duplicate_groups"] > candidates[
+        "EntityId"
+    ]["cross_split_duplicate_groups"]
+    assert primary_candidate["fields"] == ["EntityId"]
+    assert primary_candidate["candidate_confidence"] == "High"
+    assert candidates["TicketCode"]["candidate_confidence"] == "Medium"
+    assert all(item["candidate_status"] == "Candidate" for item in candidates.values())
+    assert "business_id" not in duplicate["scopes"]
+
+
+def test_target_column_is_preserved_through_safe_astype_replay():
+    frame = pd.DataFrame({
+        "feature": range(12),
+        "outcome": [0, 1] * 6,
+    })
+    code = """
+model_data = raw[["feature", "outcome"]].copy()
+X = model_data[["feature"]]
+y = model_data["outcome"].astype(int)
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.25, random_state=19, stratify=y
+)
+"""
+    flow = analyze_python_data_flow(code)
+    with TemporaryDirectory() as directory:
+        path = Path(directory) / "typed_target.csv"
+        frame.to_csv(path, index=False)
+        reconstruction = reconstruct_modeling_data(flow, path)
+
+    assert flow["target"] == {
+        "variable": "y", "column": "outcome", "source": "model_data",
+    }
+    assert flow["object_types"]["y"] == "Series"
+    assert flow["variable_columns"]["y"] == ["outcome"]
+    assert reconstruction["status"] == "Exact"
+    assert reconstruction["target_column"] == "outcome"
+    assert set(reconstruction["train_indices"]) | set(
+        reconstruction["test_indices"]
+    ) == set(frame.index)
 
 
 def test_chained_selection_cleanup_and_iloc_encoding_keep_row_lineage():
@@ -114,8 +196,14 @@ X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.4, random_
     assert duplicate["status"] == "Exact"
     assert duplicate["modeling_data"]["cleaned_rows"] == 5
     assert duplicate["modeling_data"]["model_input_variable"] == "X"
-    assert duplicate["scope"] == "business_id"
-    assert duplicate["fields"] == ["record_name"]
+    assert duplicate["scope"] == "model_input_row"
+    assert "business_id" not in duplicate["scopes"]
+    assert "candidate_id" not in duplicate["scopes"]
+    assert all(
+        candidate["fields"] != ["record_name"]
+        for candidate in duplicate["business_id_candidates"]
+    )
+    assert duplicate["fields"] == ["target", "category_y", "category_z"]
 
 
 def test_literal_slices_and_cross_cell_test_evaluation_are_project_facts():

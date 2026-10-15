@@ -53,6 +53,19 @@ FAIRNESS_METHODS = {
     },
 }
 
+SAFE_DTYPE_NAMES = {
+    "str", "string", "object", "category", "bool", "boolean",
+    "int", "int8", "int16", "int32", "int64",
+    "uint8", "uint16", "uint32", "uint64",
+    "float", "float16", "float32", "float64", "datetime64[ns]",
+}
+OBSERVATION_CALLS = {
+    "len", "print", "info", "describe", "count", "nunique", "value_counts",
+    "memory_usage", "isna", "notna", "sum", "mean", "median", "min", "max",
+    "std", "var", "quantile",
+}
+OBSERVATION_ATTRIBUTES = {"shape", "size", "ndim", "empty", "columns", "dtypes", "index"}
+
 
 def _role_from_name(name):
     value = str(name or "").casefold()
@@ -195,6 +208,31 @@ def _constant_keyword(call, name, literals):
     return _literal_value(node, literals) if node is not None else None
 
 
+def _safe_dtype_spec(node, literals):
+    """Return a JSON-safe pandas dtype spec without evaluating user code."""
+    if node is None:
+        return None
+    literal = _literal_value(node, literals)
+    if isinstance(literal, str) and literal.casefold() in SAFE_DTYPE_NAMES:
+        return literal
+    if isinstance(node, ast.Name) and node.id.casefold() in SAFE_DTYPE_NAMES:
+        return node.id.casefold()
+    if isinstance(node, ast.Attribute):
+        name = _call_name(node).split(".")[-1].casefold()
+        if name in SAFE_DTYPE_NAMES:
+            return name
+    if isinstance(node, ast.Dict):
+        output = {}
+        for key_node, value_node in zip(node.keys, node.values):
+            key = _literal_value(key_node, literals)
+            value = _safe_dtype_spec(value_node, literals)
+            if not isinstance(key, str) or value is None:
+                return None
+            output[key] = value
+        return output
+    return None
+
+
 def _slice_spec(node, literals):
     """Return a JSON-safe, statically reproducible slice description."""
     if not isinstance(node, ast.Slice):
@@ -260,6 +298,30 @@ def _dataframe_selection_spec(node, literals):
             "columns": list(columns),
         }
     return None
+
+
+def _unwrap_copy_call(node, literals):
+    """Remove outer ``DataFrame.copy`` calls that cannot change row lineage.
+
+    Only the pandas-compatible ``deep`` boolean is accepted.  The helper does
+    not evaluate the expression; it merely exposes the inner AST node so a
+    chained allowlisted operation such as ``df.dropna().copy()`` can be
+    recorded as ``dropna``.
+    """
+    while (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "copy"
+    ):
+        if node.args:
+            return node
+        unsupported = [keyword for keyword in node.keywords if keyword.arg != "deep"]
+        deep_node = _keyword(node, "deep")
+        deep = _literal_value(deep_node, literals) if deep_node is not None else True
+        if unsupported or not isinstance(deep, bool):
+            return node
+        node = node.func.value
+    return node
 
 
 def _event_location(node, file_name=None, cell=None):
@@ -344,6 +406,7 @@ class _FlowBuilder:
         self.variable_columns = {}
         self.object_types = {}
         self.constructor_inputs = {}
+        self.constructor_options = {}
         self.possible_object_types = {}
         self.role_usage = {"train": [], "validation": [], "test": []}
         self.sequence = 0
@@ -371,6 +434,29 @@ class _FlowBuilder:
                 column = _literal_value(target.slice, self.literals)
                 if not isinstance(column, str):
                     continue
+                value = node.value
+                if (
+                    isinstance(value, ast.Call)
+                    and isinstance(value.func, ast.Attribute)
+                    and value.func.attr == "astype"
+                ):
+                    selection = _dataframe_selection_spec(value.func.value, self.literals)
+                    dtype_node = value.args[0] if value.args else _keyword(value, "dtype")
+                    dtype = _safe_dtype_spec(dtype_node, self.literals)
+                    if (
+                        selection
+                        and selection.get("operation") == "column_selection"
+                        and selection.get("input") == target.value.id
+                        and len(selection.get("columns") or []) == 1
+                    ):
+                        self._add_replay_step(
+                            "astype_column", node, cell,
+                            input=target.value.id, output=target.value.id,
+                            source_column=selection["columns"][0], column=column,
+                            dtype=dtype, reconstructable=dtype is not None,
+                            expression=_expr_label(value),
+                        )
+                        continue
                 literal = _literal_value(node.value, self.literals)
                 self._add_replay_step(
                     "set_column", node, cell, input=target.value.id, output=target.value.id,
@@ -388,6 +474,47 @@ class _FlowBuilder:
         literal = _literal_value(value, self.literals)
         if len(names) == 1 and literal is not None:
             self.literals[names[0]] = literal
+
+        # ``copy`` is a no-op for row/value lineage.  Unwrapping it here lets
+        # the normal allowlist record the meaningful inner chained operation.
+        if len(names) == 1:
+            value = _unwrap_copy_call(value, self.literals)
+
+        if len(names) == 1:
+            observation_source = None
+            if (
+                isinstance(value, ast.Call)
+                and _call_name(value).split(".")[-1] in OBSERVATION_CALLS
+            ):
+                observation_source = next((
+                    candidate.id for candidate in ast.walk(value)
+                    if isinstance(candidate, ast.Name)
+                    and (
+                        candidate.id in self.variable_columns
+                        or self.object_types.get(candidate.id) in {"DataFrame", "Series"}
+                        or any(
+                            source.get("variable") == candidate.id
+                            for source in self.flow.get("source_data", [])
+                        )
+                    )
+                ), None)
+            metadata_node = value.value if isinstance(value, ast.Subscript) else value
+            if (
+                observation_source is None
+                and isinstance(metadata_node, ast.Attribute)
+                and metadata_node.attr in OBSERVATION_ATTRIBUTES
+            ):
+                candidate = _expr_label(metadata_node.value)
+                if (
+                    candidate in self.variable_columns
+                    or self.object_types.get(candidate) in {"DataFrame", "Series"}
+                ):
+                    observation_source = candidate
+            if observation_source:
+                self._add_replay_step(
+                    "observe", node, cell, input=observation_source, output=names[0],
+                    expression=_expr_label(value),
+                )
 
         selection = _dataframe_selection_spec(value, self.literals) if len(names) == 1 else None
         if selection:
@@ -455,12 +582,32 @@ class _FlowBuilder:
         if isinstance(value, ast.Call):
             call_name = _call_name(value)
             short_name = call_name.split(".")[-1]
-            if len(names) == 1 and short_name != "copy":
+            if len(names) == 1 and short_name not in {
+                "copy", "fit_transform", "transform", "fit_resample",
+                *OBSERVATION_CALLS,
+            }:
                 self.constructors[names[0]] = short_name
                 self.object_types[names[0]] = short_name
                 self.constructor_inputs[names[0]] = {
                     "positional": [_expr_label(arg) for arg in value.args],
                     "keywords": {item.arg: _expr_label(item.value) for item in value.keywords if item.arg},
+                }
+                self.constructor_options[names[0]] = {
+                    "positional": [
+                        _literal_value(argument, self.literals) for argument in value.args
+                    ],
+                    "positional_reconstructable": all(
+                        _literal_value(argument, self.literals) is not None
+                        for argument in value.args
+                    ),
+                    "keywords": {
+                        item.arg: _literal_value(item.value, self.literals)
+                        for item in value.keywords if item.arg
+                    },
+                    "keyword_reconstructable": {
+                        item.arg: _literal_value(item.value, self.literals) is not None
+                        for item in value.keywords if item.arg
+                    },
                 }
             if short_name.startswith("read_") or call_name.startswith("pd.read_"):
                 source = {
@@ -476,18 +623,166 @@ class _FlowBuilder:
                     "load", node, cell, output=names[0], path=source.get("path"), reader=call_name,
                 )
 
+            if short_name == "astype" and len(names) == 1 and isinstance(value.func, ast.Attribute):
+                receiver_expression = value.func.value
+                receiver_selection = _dataframe_selection_spec(
+                    receiver_expression, self.literals,
+                )
+                input_name = _expr_label(receiver_expression)
+                input_columns = None
+                scalar_column_selection = False
+                if (
+                    receiver_selection
+                    and receiver_selection.get("operation") == "column_selection"
+                ):
+                    input_name = receiver_selection.get("input")
+                    input_columns = list(receiver_selection.get("columns") or [])
+                    scalar_column_selection = (
+                        isinstance(receiver_expression, ast.Subscript)
+                        and isinstance(
+                            _literal_value(receiver_expression.slice, self.literals),
+                            str,
+                        )
+                    )
+                dtype_node = value.args[0] if value.args else _keyword(value, "dtype")
+                dtype = _safe_dtype_spec(dtype_node, self.literals)
+                self._add_replay_step(
+                    "astype", node, cell, input=input_name, output=names[0],
+                    input_columns=input_columns, dtype=dtype,
+                    reconstructable=dtype is not None,
+                    expression=_expr_label(value),
+                )
+                if input_columns:
+                    self.variable_columns[names[0]] = input_columns
+                elif input_name in self.variable_columns:
+                    self.variable_columns[names[0]] = list(self.variable_columns[input_name])
+                output_columns = self.variable_columns.get(names[0], [])
+                input_is_series = self.object_types.get(input_name) == "Series"
+                self.object_types[names[0]] = (
+                    "Series"
+                    if scalar_column_selection or input_is_series
+                    else self.object_types.get(input_name, "DataFrame")
+                )
+                if (
+                    names[0].casefold() in {"y", "target", "label"}
+                    and len(output_columns) == 1
+                ):
+                    self.flow["target"] = {
+                        "variable": names[0],
+                        "column": output_columns[0],
+                        "source": input_name,
+                    }
+                self.flow["lineage"].append({
+                    "from": input_name, "to": names[0], "operation": "astype",
+                    "columns": list(output_columns),
+                })
+
             if short_name == "get_dummies" and len(names) == 1 and value.args:
-                input_name = _expr_label(value.args[0])
+                input_expression = value.args[0]
+                input_selection = _dataframe_selection_spec(input_expression, self.literals)
+                input_name = _expr_label(input_expression)
+                input_columns = None
+                if input_selection and input_selection.get("operation") == "column_selection":
+                    input_name = input_selection.get("input")
+                    input_columns = list(input_selection.get("columns") or [])
+                columns_node = _keyword(value, "columns")
+                drop_first_node = _keyword(value, "drop_first")
+                dummy_na_node = _keyword(value, "dummy_na")
+                prefix_node = _keyword(value, "prefix")
+                prefix_sep_node = _keyword(value, "prefix_sep")
+                sparse_node = _keyword(value, "sparse")
+                dtype_node = _keyword(value, "dtype")
+                columns = _constant_keyword(value, "columns", self.literals)
+                drop_first = _constant_keyword(value, "drop_first", self.literals)
+                dummy_na = _constant_keyword(value, "dummy_na", self.literals)
+                prefix = _constant_keyword(value, "prefix", self.literals)
+                prefix_sep = _constant_keyword(value, "prefix_sep", self.literals)
+                sparse = _constant_keyword(value, "sparse", self.literals)
+                dtype = _safe_dtype_spec(dtype_node, self.literals)
+                supported_keywords = {
+                    "prefix", "prefix_sep", "dummy_na", "columns", "sparse",
+                    "drop_first", "dtype",
+                }
+                unknown_keywords = [
+                    item.arg for item in value.keywords
+                    if item.arg not in supported_keywords
+                ]
                 self.object_types[names[0]] = "DataFrame"
+                if input_columns:
+                    self.variable_columns[names[0]] = input_columns
+                elif input_name in self.variable_columns:
+                    self.variable_columns[names[0]] = list(self.variable_columns[input_name])
+                if names[0].casefold().startswith("x"):
+                    self.flow["feature_matrix"] = names[0]
+                    if names[0] in self.variable_columns:
+                        self.flow["selected_features"] = list(
+                            self.variable_columns[names[0]]
+                        )
                 self._add_replay_step(
                     "get_dummies", node, cell, input=input_name, output=names[0],
-                    columns=_constant_keyword(value, "columns", self.literals),
-                    drop_first=bool(_constant_keyword(value, "drop_first", self.literals)),
-                    dummy_na=bool(_constant_keyword(value, "dummy_na", self.literals)),
+                    input_columns=input_columns, columns=columns,
+                    drop_first=bool(drop_first), dummy_na=bool(dummy_na),
+                    prefix=prefix, prefix_sep=prefix_sep, sparse=sparse, dtype=dtype,
+                    reconstructable=(
+                        len(value.args) == 1
+                        and (columns_node is None or columns is not None)
+                        and (drop_first_node is None or drop_first is not None)
+                        and (dummy_na_node is None or dummy_na is not None)
+                        and (prefix_node is None or prefix is not None)
+                        and (prefix_sep_node is None or prefix_sep is not None)
+                        and (sparse_node is None or sparse is not None)
+                        and (dtype_node is None or dtype is not None)
+                        and not unknown_keywords
+                    ),
                 )
+                self.flow["lineage"].append({
+                    "from": input_name, "to": names[0], "operation": "get_dummies",
+                    "source_columns": list(input_columns or self.variable_columns.get(input_name, [])),
+                })
+
+            if (
+                short_name in {"fit_transform", "transform"}
+                and len(names) == 1
+                and isinstance(value.func, ast.Attribute)
+                and value.args
+            ):
+                transformer = _receiver_name(value)
+                transformer_type = self.constructors.get(transformer)
+                input_name = _expr_label(value.args[0])
+                input_columns = list(self.variable_columns.get(input_name, []))
+                options = deepcopy(self.constructor_options.get(transformer, {}))
+                exactly_supported = (
+                    transformer_type == "StandardScaler"
+                    and short_name == "fit_transform"
+                )
+                self._add_replay_step(
+                    "preprocess_transform", node, cell,
+                    input=input_name, output=names[0], transformer=transformer,
+                    transformer_type=transformer_type, method=short_name,
+                    options=options, row_preserving=transformer_type in PREPROCESSOR_NAMES,
+                    value_reconstructable=exactly_supported,
+                    expression=_expr_label(value),
+                )
+                if input_columns:
+                    self.variable_columns[names[0]] = input_columns
+                self.object_types[names[0]] = "DataFrame"
+                if names[0].casefold().startswith("x"):
+                    self.flow["feature_matrix"] = names[0]
+                    if input_columns:
+                        self.flow["selected_features"] = input_columns
+                self.flow["lineage"].append({
+                    "from": input_name, "to": names[0],
+                    "operation": short_name, "transformer": transformer_type,
+                    "value_reconstruction": (
+                        "Exact" if exactly_supported else "Partial"
+                    ),
+                })
 
             if short_name == "train_test_split" and len(names) >= 2:
                 args = [_expr_label(arg) for arg in value.args]
+                test_size_node = _keyword(value, "test_size")
+                train_size_node = _keyword(value, "train_size")
+                test_size = _constant_keyword(value, "test_size", self.literals)
                 train = [name for name in names if "train" in name.casefold()]
                 validation = [name for name in names if _role_from_name(name) == "validation"]
                 test = [name for name in names if _role_from_name(name) == "test"]
@@ -508,7 +803,10 @@ class _FlowBuilder:
                     "inputs": args,
                     "outputs": names,
                     "roles": role_variables,
-                    "test_size": _constant_keyword(value, "test_size", self.literals),
+                    "test_size": test_size,
+                    "test_size_provided": test_size_node is not None,
+                    "test_size_reconstructable": test_size_node is None or test_size is not None,
+                    "train_size_provided": train_size_node is not None,
                     "random_state": _constant_keyword(value, "random_state", self.literals),
                 }
                 split["calls"].append(split_event)
@@ -521,7 +819,10 @@ class _FlowBuilder:
                     "input_target": args[1] if len(args) > 1 else None,
                     "train": train,
                     "test": test,
-                    "test_size": _constant_keyword(value, "test_size", self.literals),
+                    "test_size": test_size,
+                    "test_size_provided": test_size_node is not None,
+                    "test_size_reconstructable": test_size_node is None or test_size is not None,
+                    "train_size_provided": train_size_node is not None,
                     "random_state": _constant_keyword(value, "random_state", self.literals),
                     "stratify": _expr_label(_keyword(value, "stratify")) if _keyword(value, "stratify") else None,
                 })
@@ -535,6 +836,9 @@ class _FlowBuilder:
                 self._add_replay_step(
                     "train_test_split", node, cell, inputs=args, outputs=names,
                     roles=role_variables, test_size=split_event["test_size"],
+                    test_size_provided=split_event["test_size_provided"],
+                    test_size_reconstructable=split_event["test_size_reconstructable"],
+                    train_size_provided=split_event["train_size_provided"],
                     random_state=split_event["random_state"],
                     stratify=split.get("stratify"),
                 )
@@ -938,6 +1242,7 @@ class _FlowBuilder:
         flow["variable_columns"] = deepcopy(self.variable_columns)
         flow["object_types"] = deepcopy(self.object_types)
         flow["constructor_inputs"] = deepcopy(self.constructor_inputs)
+        flow["constructor_options"] = deepcopy(self.constructor_options)
         flow["possible_object_types"] = deepcopy(self.possible_object_types)
         matrix = flow.get("split", {}).get("input_features") or flow.get("feature_matrix")
         if matrix and matrix in self.variable_columns:
@@ -1326,6 +1631,119 @@ def _replay_selector(spec):
     return spec.get("value")
 
 
+def _step_precedes_split(step, split):
+    split_line = (split or {}).get("line")
+    split_cell = (split or {}).get("cell")
+    if split_cell is None:
+        return split_line is None or (step.get("line") or 0) <= split_line
+    if step.get("cell") is None:
+        return False
+    return (
+        step.get("cell") < split_cell
+        or (
+            step.get("cell") == split_cell
+            and (step.get("line") or 0) <= (split_line or 0)
+        )
+    )
+
+
+def _required_replay_orders(flow, replay_steps):
+    """Find transformations on the backward lineage of the split inputs."""
+    split = (flow or {}).get("split", {})
+    required = {
+        value for value in (split.get("input_features"), split.get("input_target"))
+        if isinstance(value, str) and value
+    }
+    required_orders = set()
+    relevant_steps = [
+        step for step in replay_steps if _step_precedes_split(step, split)
+    ]
+    for step in reversed(relevant_steps):
+        outputs = []
+        if isinstance(step.get("output"), str):
+            outputs.append(step["output"])
+        outputs.extend(
+            value for value in (step.get("outputs") or []) if isinstance(value, str)
+        )
+        matched = required.intersection(outputs)
+        if not matched:
+            continue
+        if step.get("order") is not None:
+            required_orders.add(step["order"])
+        required.difference_update(outputs)
+        inputs = []
+        if isinstance(step.get("input"), str):
+            inputs.append(step["input"])
+        inputs.extend(
+            value for value in (step.get("inputs") or []) if isinstance(value, str)
+        )
+        required.update(inputs)
+    return required_orders
+
+
+def _standard_scaler_fit_transform(source, options):
+    """Replay sklearn's default StandardScaler math without running user code."""
+    options = options or {}
+    positional = list(options.get("positional") or [])
+    keyword_values = dict(options.get("keywords") or {})
+    keyword_safety = dict(options.get("keyword_reconstructable") or {})
+    allowed = {"copy", "with_mean", "with_std"}
+    if positional or set(keyword_values) - allowed:
+        return None
+    if any(not keyword_safety.get(name, False) for name in keyword_values):
+        return None
+    with_mean = keyword_values.get("with_mean", True)
+    with_std = keyword_values.get("with_std", True)
+    if not isinstance(with_mean, bool) or not isinstance(with_std, bool):
+        return None
+    try:
+        numeric = source.apply(pd.to_numeric, errors="raise").astype(float)
+    except (TypeError, ValueError):
+        return None
+    transformed = numeric.copy()
+    if with_mean:
+        transformed = transformed - numeric.mean(axis=0, skipna=True)
+    if with_std:
+        scale = numeric.std(axis=0, skipna=True, ddof=0).replace(0, 1).fillna(1)
+        transformed = transformed / scale
+    return transformed
+
+
+def _dummy_column_lineage(
+    source, transformed, source_lineage, columns=None, prefix=None, prefix_sep="_",
+):
+    """Map reconstructed dummy columns back to their original source fields."""
+    source_columns = list(source.columns)
+    encoded = list(columns) if columns is not None else [
+        column for column in source_columns
+        if str(source[column].dtype) in {"object", "string", "category", "bool", "boolean"}
+    ]
+    if prefix is None:
+        prefixes = {column: str(column) for column in encoded}
+    elif isinstance(prefix, str) and len(encoded) == 1:
+        prefixes = {encoded[0]: prefix}
+    elif isinstance(prefix, list) and len(prefix) == len(encoded):
+        prefixes = dict(zip(encoded, map(str, prefix)))
+    else:
+        prefixes = {}
+    output = {}
+    for column in transformed.columns:
+        if column in source_columns and column not in encoded:
+            output[column] = list(source_lineage.get(column, [column]))
+            continue
+        matches = [
+            source_column for source_column in encoded
+            if source_column in prefixes
+            and str(column).startswith(f"{prefixes[source_column]}{prefix_sep}")
+        ]
+        if matches:
+            source_column = max(matches, key=lambda item: len(str(item)))
+            output[column] = list(source_lineage.get(source_column, [source_column]))
+        else:
+            output[column] = []
+    return output
+
+
 def reconstruct_modeling_data(flow, csv_path, data_result=None):
     """Safely replay supported dataframe lineage and recover split membership.
 
@@ -1338,6 +1756,7 @@ def reconstruct_modeling_data(flow, csv_path, data_result=None):
     selected_flow = _flow_for_dataset(flow, csv_path)
     base = {
         "status": "Unable to reconstruct",
+        "row_reconstruction": "Unable to verify",
         "reason": None,
         "source_csv": Path(csv_path).name,
         "source_variable": None,
@@ -1345,6 +1764,8 @@ def reconstruct_modeling_data(flow, csv_path, data_result=None):
         "cleaned_rows": None,
         "model_input_variable": None,
         "model_input_columns": [],
+        "model_input_source_columns": [],
+        "model_input_feature_lineage": {},
         "field_reconstruction": "Exact",
         "unresolved_field_operations": [],
         "target_column": (selected_flow.get("target") or {}).get("column"),
@@ -1362,47 +1783,52 @@ def reconstruct_modeling_data(flow, csv_path, data_result=None):
         return {**base, "reason": f"CSV read failed: {exc}"}
     base["raw_rows"] = len(original)
     frames = {}
+    frame_lineage = {}
     replay_steps = list(selected_flow.get("replay_steps", []))
+    required_replay_orders = _required_replay_orders(selected_flow, replay_steps)
     wanted = Path(csv_path).name.casefold()
     matched_load = False
-    split_line = (selected_flow.get("split") or {}).get("line")
-    split_cell = (selected_flow.get("split") or {}).get("cell")
+    split = selected_flow.get("split", {})
 
     for step in replay_steps:
         operation = step.get("operation")
         input_name = step.get("input")
         output_name = step.get("output")
-        step_before_split = (
-            split_cell is None and (split_line is None or (step.get("line") or 0) <= split_line)
-        ) or (
-            split_cell is not None
-            and step.get("cell") is not None
-            and (
-                step.get("cell") < split_cell
-                or (
-                    step.get("cell") == split_cell
-                    and (step.get("line") or 0) <= (split_line or 0)
-                )
-            )
-        )
-        if operation == "unsupported" and step_before_split:
-            return {
-                **base,
-                "reason": (
-                    f"cannot safely replay {step.get('output')}: {step.get('expression')} "
-                    f"({step.get('reason')})"
-                ),
-            }
+        step_required = step.get("order") in required_replay_orders
+        if operation == "observe":
+            if step_required:
+                return {
+                    **base,
+                    "reason": (
+                        f"observation result {step.get('output')} is used as modeling data "
+                        "and cannot be safely replayed"
+                    ),
+                }
+            continue
+        if operation == "unsupported":
+            if step_required:
+                return {
+                    **base,
+                    "reason": (
+                        f"cannot safely replay {step.get('output')}: {step.get('expression')} "
+                        f"({step.get('reason')})"
+                    ),
+                }
+            continue
         if operation == "load":
             source_path = step.get("path")
             if source_path is None or Path(str(source_path)).name.casefold() == wanted:
                 frames[output_name] = original.copy()
+                frame_lineage[output_name] = {
+                    column: [column] for column in original.columns
+                }
                 matched_load = True
                 base["source_variable"] = output_name
             continue
         if operation == "assign":
             if input_name in frames:
                 frames[output_name] = frames[input_name].copy()
+                frame_lineage[output_name] = deepcopy(frame_lineage.get(input_name, {}))
             continue
         if operation == "set_column":
             source = frames.get(input_name)
@@ -1421,29 +1847,200 @@ def reconstruct_modeling_data(flow, csv_path, data_result=None):
                         "line": step.get("line"), "cell": step.get("cell"),
                     })
                 frames[output_name] = updated
+                lineage = deepcopy(frame_lineage.get(input_name, {}))
+                lineage[step.get("column")] = []
+                frame_lineage[output_name] = lineage
+            continue
+        if operation == "astype_column":
+            source = frames.get(input_name)
+            if source is None:
+                continue
+            if not step.get("reconstructable"):
+                updated = source.copy()
+                source_column = step.get("source_column")
+                target_column = step.get("column")
+                if source_column in source.columns:
+                    updated[target_column] = source[source_column]
+                frames[output_name] = updated
+                lineage = deepcopy(frame_lineage.get(input_name, {}))
+                lineage[target_column] = list(lineage.get(source_column, [source_column]))
+                frame_lineage[output_name] = lineage
+                base["field_reconstruction"] = "Partial"
+                base["unresolved_field_operations"].append({
+                    "operation": "astype", "column": target_column,
+                    "expression": step.get("expression"),
+                    "reason": "row lineage is preserved but the dtype is not statically known",
+                    "line": step.get("line"), "cell": step.get("cell"),
+                })
+                continue
+            source_column = step.get("source_column")
+            target_column = step.get("column")
+            if source_column not in source.columns:
+                return {
+                    **base,
+                    "reason": f"type-conversion source column is unavailable: {source_column}",
+                }
+            try:
+                updated = source.copy()
+                updated[target_column] = updated[source_column].astype(step.get("dtype"))
+                frames[output_name] = updated
+                lineage = deepcopy(frame_lineage.get(input_name, {}))
+                lineage[target_column] = list(lineage.get(source_column, [source_column]))
+                frame_lineage[output_name] = lineage
+            except Exception as exc:
+                return {**base, "reason": f"type-conversion replay failed: {exc}"}
+            continue
+        if operation == "astype":
+            source = frames.get(input_name)
+            if source is None:
+                continue
+            input_columns = list(step.get("input_columns") or [])
+            if input_columns:
+                if not all(column in source.columns for column in input_columns):
+                    return {
+                        **base,
+                        "reason": f"type-conversion columns are unavailable: {input_columns}",
+                    }
+                source = source[input_columns].copy()
+            if not step.get("reconstructable"):
+                frames[output_name] = source.copy()
+                source_lineage = frame_lineage.get(input_name, {})
+                frame_lineage[output_name] = {
+                    column: list(source_lineage.get(column, [column]))
+                    for column in source.columns
+                }
+                base["field_reconstruction"] = "Partial"
+                base["unresolved_field_operations"].append({
+                    "operation": "astype", "expression": step.get("expression"),
+                    "reason": "row lineage is preserved but the dtype is not statically known",
+                    "line": step.get("line"), "cell": step.get("cell"),
+                })
+                continue
+            try:
+                frames[output_name] = source.astype(step.get("dtype")).copy()
+                source_lineage = frame_lineage.get(input_name, {})
+                frame_lineage[output_name] = {
+                    column: list(source_lineage.get(column, [column]))
+                    for column in frames[output_name].columns
+                }
+            except Exception as exc:
+                return {**base, "reason": f"type-conversion replay failed: {exc}"}
             continue
         if operation == "get_dummies":
             source = frames.get(input_name)
             if source is not None:
-                columns = step.get("columns")
-                frames[output_name] = pd.get_dummies(
-                    source,
-                    columns=columns,
-                    drop_first=bool(step.get("drop_first")),
-                    dummy_na=bool(step.get("dummy_na")),
+                input_columns = list(step.get("input_columns") or [])
+                if input_columns:
+                    if not all(column in source.columns for column in input_columns):
+                        return {
+                            **base,
+                            "reason": f"get_dummies input columns are unavailable: {input_columns}",
+                        }
+                    source = source[input_columns].copy()
+                if not step.get("reconstructable", True):
+                    frames[output_name] = source.copy()
+                    source_lineage = frame_lineage.get(input_name, {})
+                    frame_lineage[output_name] = {
+                        column: list(source_lineage.get(column, [column]))
+                        for column in source.columns
+                    }
+                    base["field_reconstruction"] = "Partial"
+                    base["unresolved_field_operations"].append({
+                        "operation": "get_dummies",
+                        "reason": (
+                            "row lineage is preserved but one or more encoding "
+                            "arguments are not statically known"
+                        ),
+                        "line": step.get("line"), "cell": step.get("cell"),
+                    })
+                    continue
+                try:
+                    dummy_options = {
+                        "columns": step.get("columns"),
+                        "drop_first": bool(step.get("drop_first")),
+                        "dummy_na": bool(step.get("dummy_na")),
+                    }
+                    for option in ("prefix", "prefix_sep", "sparse", "dtype"):
+                        if step.get(option) is not None:
+                            dummy_options[option] = step[option]
+                    frames[output_name] = pd.get_dummies(source, **dummy_options)
+                    source_lineage = frame_lineage.get(input_name, {})
+                    frame_lineage[output_name] = _dummy_column_lineage(
+                        source, frames[output_name], source_lineage,
+                        columns=step.get("columns"),
+                        prefix=step.get("prefix"),
+                        prefix_sep=(
+                            "_" if step.get("prefix_sep") is None
+                            else step.get("prefix_sep")
+                        ),
+                    )
+                except Exception as exc:
+                    return {**base, "reason": f"get_dummies replay failed: {exc}"}
+            continue
+        if operation == "preprocess_transform":
+            source = frames.get(input_name)
+            if source is None:
+                continue
+            if not step.get("row_preserving"):
+                if step_required:
+                    return {
+                        **base,
+                        "reason": (
+                            f"cannot safely establish row lineage for "
+                            f"{step.get('expression')}"
+                        ),
+                    }
+                continue
+            transformed = None
+            if (
+                step.get("transformer_type") == "StandardScaler"
+                and step.get("method") == "fit_transform"
+            ):
+                transformed = _standard_scaler_fit_transform(
+                    source, step.get("options"),
                 )
+            if transformed is None:
+                # Known sklearn preprocessors preserve row membership for
+                # fit_transform/transform.  A private copy is sufficient for
+                # split reconstruction, but must never be presented as exact
+                # transformed feature values.
+                transformed = source.copy()
+                base["field_reconstruction"] = "Partial"
+                base["unresolved_field_operations"].append({
+                    "operation": step.get("method"),
+                    "transformer": step.get("transformer_type"),
+                    "expression": step.get("expression"),
+                    "reason": "row lineage is preserved but transformed feature values are not reconstructed",
+                    "line": step.get("line"), "cell": step.get("cell"),
+                })
+            frames[output_name] = transformed
+            source_lineage = frame_lineage.get(input_name, {})
+            frame_lineage[output_name] = {
+                column: list(source_lineage.get(column, [column]))
+                for column in transformed.columns
+            }
             continue
         if operation == "column_selection":
             source = frames.get(input_name)
             columns = list(step.get("columns") or [])
             if source is not None and all(column in source.columns for column in columns):
                 frames[output_name] = source[columns].copy()
+                source_lineage = frame_lineage.get(input_name, {})
+                frame_lineage[output_name] = {
+                    column: list(source_lineage.get(column, [column]))
+                    for column in columns
+                }
             continue
         if operation == "drop_columns":
             source = frames.get(input_name)
             columns = list(step.get("columns") or [])
             if source is not None and all(column in source.columns for column in columns):
                 frames[output_name] = source.drop(columns=columns).copy()
+                source_lineage = frame_lineage.get(input_name, {})
+                frame_lineage[output_name] = {
+                    column: list(source_lineage.get(column, [column]))
+                    for column in frames[output_name].columns
+                }
             continue
         if operation in {"dropna", "drop_duplicates"}:
             source = frames.get(input_name)
@@ -1509,6 +2106,11 @@ def reconstruct_modeling_data(flow, csv_path, data_result=None):
             destination = output_name or (input_name if step.get("inplace") else None)
             if destination:
                 frames[destination] = cleaned.copy()
+                source_lineage = frame_lineage.get(input_name, {})
+                frame_lineage[destination] = {
+                    column: list(source_lineage.get(column, [column]))
+                    for column in cleaned.columns
+                }
             continue
         if operation == "row_slice":
             source = frames.get(input_name)
@@ -1517,6 +2119,7 @@ def reconstruct_modeling_data(flow, csv_path, data_result=None):
                 frames[output_name] = source.iloc[
                     slice(spec.get("start"), spec.get("stop"), spec.get("step"))
                 ].copy()
+                frame_lineage[output_name] = deepcopy(frame_lineage.get(input_name, {}))
             continue
         if operation in {"iloc_selection", "loc_selection"}:
             source = frames.get(input_name)
@@ -1528,6 +2131,15 @@ def reconstruct_modeling_data(flow, csv_path, data_result=None):
                 accessor = source.iloc if operation == "iloc_selection" else source.loc
                 selected = accessor[rows, columns]
                 frames[output_name] = selected.copy()
+                selected_columns = (
+                    list(selected.columns) if isinstance(selected, pd.DataFrame)
+                    else [selected.name]
+                )
+                source_lineage = frame_lineage.get(input_name, {})
+                frame_lineage[output_name] = {
+                    column: list(source_lineage.get(column, [column]))
+                    for column in selected_columns
+                }
             except Exception as exc:
                 return {
                     **base,
@@ -1538,13 +2150,25 @@ def reconstruct_modeling_data(flow, csv_path, data_result=None):
     # the CSV passed separately.  Bind one unambiguous external dataframe root
     # to that explicit input, then replay from the beginning.
     if not matched_load:
+        required_steps = [
+            step for step in replay_steps
+            if step.get("order") in required_replay_orders
+        ]
+        if not required_steps:
+            required_steps = list(replay_steps)
         referenced = [
-            step.get("input") for step in replay_steps
+            step.get("input") for step in required_steps
             if step.get("input") and step.get("input") not in frames
         ]
+        produced = {
+            value
+            for step in required_steps
+            for value in [step.get("output"), *(step.get("outputs") or [])]
+            if isinstance(value, str)
+        }
         roots = [
             name for name in dict.fromkeys(referenced)
-            if isinstance(name, str) and name.isidentifier()
+            if isinstance(name, str) and name.isidentifier() and name not in produced
         ]
         root = roots[0] if len(roots) == 1 else ("df" if "df" in roots else None)
         if root:
@@ -1556,7 +2180,6 @@ def reconstruct_modeling_data(flow, csv_path, data_result=None):
             ]
             return reconstruct_modeling_data({"files": [rebound]}, csv_path, data_result)
 
-    split = selected_flow.get("split", {})
     model_variable = split.get("input_features") or selected_flow.get("feature_matrix")
     model_frame = frames.get(model_variable)
     if isinstance(model_frame, pd.Series):
@@ -1565,6 +2188,16 @@ def reconstruct_modeling_data(flow, csv_path, data_result=None):
         return {**base, "reason": f"model input variable {model_variable or '?'} could not be replayed"}
     base["model_input_variable"] = model_variable
     base["model_input_columns"] = list(model_frame.columns)
+    model_lineage = frame_lineage.get(model_variable, {})
+    base["model_input_feature_lineage"] = {
+        str(column): list(model_lineage.get(column, []))
+        for column in model_frame.columns
+    }
+    base["model_input_source_columns"] = list(dict.fromkeys(
+        source_column
+        for column in model_frame.columns
+        for source_column in model_lineage.get(column, [])
+    ))
     base["cleaned_rows"] = len(model_frame)
 
     method = split.get("method") or ("train_test_split" if split.get("calls") else None)
@@ -1572,6 +2205,13 @@ def reconstruct_modeling_data(flow, csv_path, data_result=None):
         if method == "train_test_split":
             if split.get("random_state") is None:
                 return {**base, "reason": "train_test_split random_state is unknown"}
+            if split.get("train_size_provided"):
+                return {**base, "reason": "train_test_split train_size replay is not supported"}
+            if (
+                split.get("test_size_provided")
+                and not split.get("test_size_reconstructable", True)
+            ):
+                return {**base, "reason": "train_test_split test_size is unknown"}
             from sklearn.model_selection import train_test_split
 
             indices = list(model_frame.index)
@@ -1615,10 +2255,16 @@ def reconstruct_modeling_data(flow, csv_path, data_result=None):
             }
     except Exception as exc:
         return {**base, "reason": f"split replay failed: {exc}"}
+    values_exact = base.get("field_reconstruction") == "Exact"
     return {
         **base,
-        "status": "Exact",
-        "evidence_level": "Verified from imported data + reconstructed operation",
+        "status": "Exact" if values_exact else "Partial",
+        "row_reconstruction": "Exact",
+        "evidence_level": (
+            "Verified from imported data + reconstructed operation"
+            if values_exact else
+            "Verified row lineage; transformed feature values are partially reconstructed"
+        ),
         "reason": None,
         "train_indices": [int(value) if isinstance(value, int) else value for value in train_index],
         "test_indices": [int(value) if isinstance(value, int) else value for value in test_index],

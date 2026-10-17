@@ -1,0 +1,269 @@
+"""Grounded Finding review: immutable analyzer metadata and adversarial model output."""
+import copy
+import json
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import pandas as pd
+import pytest
+
+import agent
+from code_analyzer import analyze_code_with_ast
+from data_analyzer import analyze_csv
+from data_flow_analyzer import analyze_python_data_flow
+from consistency_validator import (
+    build_analysis_facts, build_findings, render_structured_review,
+    validate_agent_consistency, validate_report_consistency,
+)
+from report import build_report_data, build_markdown_report, build_pdf_report
+
+
+SOURCE = '''from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+scaler = StandardScaler()
+X = df[["age", "fare"]]
+y = df["target"]
+X = scaler.fit_transform(X)
+X_train, X_test, y_train, y_test = train_test_split(X, y, random_state=42)
+'''
+
+
+@pytest.fixture
+def facts():
+    code = [{"file": "titanic.py", "issues": analyze_code_with_ast(SOURCE)}]
+    return build_analysis_facts(code, [], analyze_python_data_flow(SOURCE))
+
+
+def test_findings_keep_metadata_counts_locations_and_stable_ids(facts):
+    original = copy.deepcopy(facts)
+    assert facts["findings"]
+    for finding in facts["findings"]:
+        raw = next(i for i in facts["formal_code_issues"]
+                   if i["rule_id"] == finding["rule_id"] and i.get("line") == finding["location"]["line"])
+        assert finding["severity"] == raw["severity"]
+        assert finding["confidence"] == raw["confidence"]
+        assert finding["location"]["file"] == raw["file"]
+        assert finding["evidence"] == raw["evidence"]
+    rebuilt = build_findings([
+        {"file": i["file"], "issues": [i]} for i in reversed(facts["formal_code_issues"])
+    ], [])
+    assert rebuilt == facts["findings"]
+    assert facts == original
+
+
+def test_high_confidence_leakage_stays_static_risk(facts):
+    finding = next(f for f in facts["findings"] if f["type"] == "Data Leakage Risk")
+    assert finding["confidence"] == "High"
+    assert finding["verification_status"] == "static_risk"
+
+
+@pytest.mark.parametrize("claim", [
+    "模型准确率显著下降。", "性能严重高估。", "模型性能被严重高估。",
+    "Accuracy significantly decreases.", "已经证实发生数据泄漏。",
+    "准确率为0.93。", "训练集有9999行。", "下降三个百分点。",
+    "建议调用 ghost_scaler.fit(X)。", "建议检查 `invented_target`。",
+    "问题位于 invented.py。", "严重程度应升级为 Critical。", "存在医疗风险。",
+])
+def test_untrusted_local_claim_removed_without_losing_useful_advice(facts, claim):
+    finding = facts["findings"][0]
+    review = render_structured_review({"explanations": [{
+        "finding_id": finding["id"],
+        "cause": "建议核查预处理的拟合顺序。" + claim,
+    }]}, facts)
+    assert "建议核查预处理的拟合顺序。" in review
+    assert claim not in review
+    assert "Unable to verify automatically" not in review
+    assert finding["id"] in review
+
+
+def test_ai_cannot_override_fields_or_add_confirmed_findings(facts):
+    original = copy.deepcopy(facts)
+    fid = facts["findings"][0]["id"]
+    review = render_structured_review({"explanations": [
+        {"finding_id": fid, "severity": "Critical", "location": {"file": "invented.py"},
+         "verification_status": "confirmed_error", "count": 9999,
+         "cause": "建议核查拟合数据的范围。"},
+        {"finding_id": "F-invented", "cause": "新增确定性错误。"},
+    ], "unverified_suggestions": ["建议核查部署环境中的依赖一致性。"]}, facts)
+    assert "Critical" not in review and "invented.py" not in review
+    assert "F-invented" not in review and "新增确定性错误" not in review
+    assert "待验证建议（不计入原始检测数量）" in review
+    assert facts == original
+    for finding in facts["findings"]:
+        assert f"### {finding['id']} · {finding['type']}" in review
+
+
+@pytest.mark.parametrize("payload", [None, {}, {"explanations": "invalid"}, [],
+                                         {"explanations": [{"finding_id": "unknown"}]}])
+def test_missing_or_invalid_ai_never_omits_base_findings(facts, payload):
+    review = render_structured_review(payload, facts)
+    for f in facts["findings"]:
+        assert f["id"] in review and str(f["evidence"]) in review
+    assert "验证限制" in review
+
+
+def test_local_legacy_correction_retains_valid_neighboring_sentences(facts):
+    text = "建议使用训练集拟合预处理器。模型准确率显著下降。请独立保留最终测试集。"
+    corrected, notes = validate_agent_consistency(text, facts)
+    assert "建议使用训练集拟合预处理器。" in corrected
+    assert "请独立保留最终测试集。" in corrected
+    assert "模型准确率显著下降" not in corrected
+    assert "Unable to verify automatically" not in corrected
+    assert notes
+
+
+def test_observed_error_and_manual_review_are_distinguished():
+    code = [{"file": "bad.py", "issues": analyze_code_with_ast("def :\n") }]
+    data = [{"file": "data.csv", "result": {"issues": [
+        {"rule_id": "DQ_NON_FINITE_NUMERIC", "type": "Nonfinite", "issue_nature": "Confirmed Invalid",
+         "severity": "High", "confidence": "High", "count": 2},
+        {"rule_id": "DQ_OUTLIER", "type": "Outlier", "issue_nature": "Statistical Anomaly",
+         "severity": "Medium", "confidence": "High", "count": 3},
+    ]}}]
+    items = build_findings(code, data)
+    assert {f["type"]: f["verification_status"] for f in items} == {
+        "Syntax Error": "confirmed_error", "Nonfinite": "confirmed_error", "Outlier": "needs_review",
+    }
+    assert next(f for f in items if f["type"] == "Nonfinite")["detected_count"] == 2
+
+
+def test_cardekho_feature_reuse_is_not_proven_entity_leakage(tmp_path):
+    path = tmp_path / "cardekho.csv"
+    pd.DataFrame({"row_number": range(12), "car_name": ["sedan", "suv"] * 6,
+                  "target": range(12)}).to_csv(path, index=False)
+    source = '''X = df[["car_name"]]
+y = df["target"]
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.5, random_state=17)
+'''
+    flow = analyze_python_data_flow(source)
+    result = analyze_csv(path, data_flow=flow)
+    facts = build_analysis_facts([], [{"file": path.name, "result": result}], flow,
+                                 duplicate_split_analysis=result["duplicate_split_analysis"])
+    finding = next(f for f in facts["findings"] if f["rule_id"] == "DQ_CROSS_SPLIT_FEATURE_COMBINATIONS")
+    assert finding["severity"] == "Low" and finding["confidence"] == "Medium"
+    assert finding["verification_status"] == "needs_review"
+    review = render_structured_review({"explanations": [{"finding_id": finding["id"],
+        "cause": "相同车型说明已确认实体泄漏。", "potential_impact": "性能严重高估。"}]}, facts)
+    assert "相同车型说明已确认实体泄漏" not in review
+    assert "性能严重高估" not in review
+    assert "需要人工复核" in review
+
+
+def test_agent_json_contract_and_format_fallback(facts):
+    code = [{"file": i["file"], "issues": [i]} for i in facts["formal_code_issues"]]
+    def fake_create(**kwargs):
+        assert kwargs["response_format"] == {"type": "json_object"}
+        prompt = kwargs["messages"][1]["content"]
+        assert "finding_id" in prompt and "analysis_facts" in prompt
+        assert facts["findings"][0]["id"] in prompt
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="not json"))])
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=fake_create)))
+    with patch.object(agent, "get_client", return_value=client):
+        review = agent.run_agent(code, [], analysis_facts=facts, knowledge_context="")
+    assert "未返回有效的结构化解释" in review
+    for f in facts["findings"]:
+        assert f["id"] in review
+
+
+def test_canonical_review_validation_is_idempotent_and_evidence_unchanged(facts):
+    review = render_structured_review({}, facts)
+    checked, _ = validate_agent_consistency(review, facts)
+    twice, _ = validate_agent_consistency(checked, facts)
+    assert twice == checked
+    for f in facts["findings"]:
+        assert str(f["evidence"]) in twice
+
+
+def test_findings_export_even_without_ai(facts):
+    code = [{"file": i["file"], "issues": [i]} for i in facts["formal_code_issues"]]
+    report = build_report_data({"project_name": "Titanic", "python_file_count": 1},
+                              code, [], None, [], "", {}, analysis_facts=facts)
+    report = validate_report_consistency(report)
+    assert report["findings"] == facts["findings"]
+    markdown = build_markdown_report(report)
+    for f in facts["findings"]:
+        assert f["id"] in markdown
+    assert build_pdf_report(report).startswith(b"%PDF")
+
+
+def test_valid_json_annotations_reach_pipeline_and_both_exports(tmp_path):
+    import app
+    path = tmp_path / "titanic.py"
+    path.write_text(SOURCE, encoding="utf-8")
+    state = SimpleNamespace()
+    def create(**kwargs):
+        # The prompt carries the immutable first-party ID; return explanations only.
+        import re
+        ids = list(dict.fromkeys(re.findall(r'"id": "(F-[a-f0-9-]+)"', kwargs["messages"][1]["content"])))
+        assert ids
+        payload = {"explanations": [{"finding_id": fid,
+                   "cause": "预处理的拟合范围需要与训练集边界一致。",
+                   "potential_impact": "若拟合时使用了测试数据，评估可能产生乐观偏差。",
+                   "recommendation": "先划分数据，再仅在训练集上拟合预处理器。"} for fid in ids]}
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(payload, ensure_ascii=False)))])
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    with patch.object(app.st, "session_state", state), patch.object(agent, "get_client", return_value=client):
+        app.analyze_project_files([("titanic.py", path)])
+    assert state.analysis_error is None
+    assert "预处理的拟合范围需要与训练集边界一致" in state.agent_report
+    assert "先划分数据，再仅在训练集上拟合预处理器" in state.report_markdown
+    assert state.report_pdf.startswith(b"%PDF")
+    assert state.report_data["findings"] == state.analysis_facts["findings"]
+    assert state.enhancement_status["ai"]["status"] == "success"
+
+
+def test_malformed_json_id_type_falls_back_per_finding(facts):
+    review = render_structured_review({"explanations": [{"finding_id": {"unexpected": "dict"}}]}, facts)
+    assert "已忽略" in review
+    for f in facts["findings"]:
+        assert f["id"] in review
+
+
+def test_correction_retains_advice_in_same_sentence(facts):
+    text = "模型准确率显著下降，请检查预处理拟合范围。"
+    review, _ = validate_agent_consistency(text, facts)
+    assert "显著下降" not in review
+    assert "请检查预处理拟合范围。" in review
+
+
+def test_explicit_upstream_verification_and_counts_are_not_rewritten():
+    original = [{"file": "example.py", "cell": 4, "issues": [{
+        "rule_id": "EXAMPLE", "type": "Example", "line": 5,
+        "severity": "Medium", "confidence": "Low", "count": 7, "rate": 0.25,
+        "verification_status": "needs_review", "evidence": "原始计数与验证结果。",
+    }]}]
+    finding = build_findings(original, [])[0]
+    assert finding["verification_status"] == "needs_review"
+    assert finding["detected_count"] == 7 and finding["detected_rate"] == 0.25
+    assert finding["location"]["cell"] == 4 and finding["location"]["line"] == 5
+    review = render_structured_review({}, {"findings": [finding]})
+    assert "检测数量：7" in review and "检测比例（原始值）：0.25" in review
+
+
+def test_id_does_not_change_when_evidence_count_or_severity_updates():
+    raw = [{"file": "data.csv", "result": {"issues": [{
+        "rule_id": "DQ_EXAMPLE", "type": "Example", "column": "age", "count": 2,
+        "severity": "Medium", "confidence": "High", "evidence": "发现2条记录。",
+    }]}}]
+    first = build_findings([], raw)[0]
+    revised = copy.deepcopy(raw)
+    revised[0]["result"]["issues"][0].update(count=3, severity="Low", evidence="发现3条记录。")
+    second = build_findings([], revised)[0]
+    assert first["id"] == second["id"]
+    assert first["severity"] == "Medium" and second["severity"] == "Low"
+
+
+def test_pending_suggestions_cannot_deny_existing_split(facts):
+    assert facts["detected_split"]
+    review = render_structured_review({"unverified_suggestions": ["No test set was created."]}, facts)
+    assert "No test set was created" not in review
+    assert "已检测到训练/测试划分" in review
+
+
+def test_repeated_explanations_are_grouped_without_dropping_ids(facts):
+    text = "建议核查预处理的拟合范围。"
+    payload = {"explanations": [{"finding_id": f["id"], "cause": text} for f in facts["findings"]]}
+    review = render_structured_review(payload, facts)
+    assert review.count(text) == 1
+    for f in facts["findings"]:
+        assert f["id"] in review

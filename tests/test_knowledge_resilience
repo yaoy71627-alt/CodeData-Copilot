@@ -1,0 +1,199 @@
+"""P0 failure injection: static diagnostics and both exports must survive."""
+import copy
+import html
+import re
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import pytest
+import agent
+import app
+from report import build_markdown_report, build_pdf_report
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def client_returning(text="## 1. 项目总结\n测试审查"):
+    return SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(
+        create=lambda **kwargs: SimpleNamespace(choices=[
+            SimpleNamespace(message=SimpleNamespace(content=text))]))))
+
+
+def run_pipeline(generate_ai=True):
+    state = SimpleNamespace()
+    with patch.object(app.st, "session_state", state):
+        app.analyze_project_files([
+            ("test.ipynb", ROOT / "demo_data/test.ipynb"),
+            ("train.csv", ROOT / "demo_data/train.csv"),
+        ], generate_ai=generate_ai)
+    return state
+
+
+@pytest.fixture
+def baseline():
+    with patch.object(agent, "get_client", return_value=client_returning()):
+        return run_pipeline()
+
+
+def assert_static_preserved(state, baseline):
+    assert state.code_result == baseline.code_result
+    assert state.data_results == baseline.data_results
+    assert state.health == baseline.health
+    assert state.repair_suggestions == baseline.repair_suggestions
+    assert state.report_data["code_quality"] == baseline.report_data["code_quality"]
+    assert state.report_data["data_quality"] == baseline.report_data["data_quality"]
+    assert state.report_markdown
+    assert state.report_pdf.startswith(b"%PDF")
+    assert state.report_error is None
+
+
+@pytest.mark.parametrize("failure,expected", [
+    ("missing_dir", "read_failed"), ("unreadable", "read_failed"),
+    ("encoding", "read_failed"), ("retrieval", "retrieval_failed"),
+    ("empty", "empty"),
+])
+def test_knowledge_faults_preserve_static_and_export(failure, expected, baseline, tmp_path):
+    if failure == "missing_dir":
+        fault = patch.object(agent, "KNOWLEDGE_DIR", tmp_path / "absent")
+    elif failure == "unreadable":
+        fault = patch.object(Path, "read_text", side_effect=PermissionError("private payload"))
+    elif failure == "encoding":
+        fault = patch.object(agent, "load_knowledge_documents", side_effect=UnicodeError("bad encoding"))
+    elif failure == "retrieval":
+        fault = patch.object(agent, "retrieve_relevant_knowledge", side_effect=RuntimeError("private payload"))
+    else:
+        fault = patch.object(agent, "retrieve_relevant_knowledge", return_value="")
+    # Restrict read fault to knowledge: all input fixtures are read as bytes.
+    with fault, patch.object(agent, "get_client", return_value=client_returning()):
+        state = run_pipeline()
+    assert_static_preserved(state, baseline)
+    assert state.enhancement_status["knowledge"]["status"] == expected
+    assert state.enhancement_status["ai"]["status"] == "success"
+    assert not state.enhancement_status["ai"]["used_knowledge"]
+    assert expected in state.report_markdown
+    assert "private payload" not in state.report_markdown
+
+
+@pytest.mark.parametrize("failure,expected", [
+    ("missing_key", "missing_api_key"), ("timeout", "timeout"), ("api", "api_failed"),
+])
+def test_ai_faults_preserve_static_and_export(failure, expected, baseline, monkeypatch):
+    if failure == "missing_key":
+        monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
+        fault = patch.object(agent, "KNOWLEDGE_DIR", ROOT / "knowledge")
+    else:
+        exc = TimeoutError("private payload") if failure == "timeout" else RuntimeError("private payload")
+        fault = patch.object(agent, "get_client", side_effect=exc)
+    with fault:
+        state = run_pipeline()
+    assert_static_preserved(state, baseline)
+    assert state.enhancement_status["ai"]["status"] == expected
+    assert expected in state.report_markdown
+    assert "private payload" not in state.report_markdown
+
+
+def test_explicit_empty_context_never_retrieves():
+    with patch.object(agent, "retrieve_relevant_knowledge", side_effect=AssertionError("duplicate")) as retrieve, \
+         patch.object(agent, "get_client", return_value=client_returning()):
+        assert agent.run_agent([], [], knowledge_context="")
+        retrieve.assert_not_called()
+
+
+def test_omitted_context_retrieves_once_and_survives_failure():
+    with patch.object(agent, "retrieve_relevant_knowledge", side_effect=RuntimeError("failure")) as retrieve, \
+         patch.object(agent, "get_client", return_value=client_returning()):
+        assert agent.run_agent([], [])
+        retrieve.assert_called_once()
+
+
+def test_success_records_real_rules_and_sources(baseline):
+    knowledge = baseline.enhancement_status["knowledge"]
+    assert knowledge["sources"] and knowledge["rules"]
+    assert baseline.enhancement_status["ai"]["used_knowledge"]
+    for text in knowledge["sources"] + knowledge["rules"]:
+        assert text in baseline.report_markdown
+
+
+def test_refresh_failure_preserves_previous_results_and_records_failure(baseline):
+    before = copy.deepcopy(baseline)
+    with patch.object(app.st, "session_state", baseline), \
+         patch.object(agent, "get_client", side_effect=TimeoutError("secret")), \
+         patch.object(agent, "KNOWLEDGE_DIR", ROOT / "absent"):
+        app.refresh_ai_review()
+    assert_static_preserved(baseline, before)
+    assert baseline.agent_report == before.agent_report
+    assert baseline.enhancement_status["ai"]["previous_review_retained"]
+    assert "上次成功结果" in baseline.report_markdown
+    assert "timeout" in baseline.report_markdown
+
+
+def test_no_ai_and_missing_knowledge_still_exports(baseline, tmp_path):
+    with patch.object(agent, "KNOWLEDGE_DIR", tmp_path / "absent"):
+        state = run_pipeline(generate_ai=False)
+    assert_static_preserved(state, baseline)
+    assert state.enhancement_status["ai"]["status"] == "disabled"
+
+
+def test_pdf_contains_status_and_sources(baseline):
+    # Capture PDF paragraph input to verify both exporters use the audit section.
+    from reportlab.platypus import Paragraph
+    captured = []
+    def capture(text, *args, **kwargs):
+        captured.append(html.unescape(re.sub(r"<[^>]+>", "", text)))
+        return Paragraph(text, *args, **kwargs)
+    with patch("reportlab.platypus.Paragraph", side_effect=capture):
+        assert build_pdf_report(baseline.report_data).startswith(b"%PDF")
+    assert any("知识库用于本次 AI Review" in text for text in captured)
+    assert any(baseline.enhancement_status["knowledge"]["sources"][0] in text for text in captured)
+
+
+def test_api_client_has_bounded_timeout_and_no_retries(monkeypatch):
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "test-placeholder")
+    with patch("openai.OpenAI") as ctor:
+        agent.get_client()
+    assert ctor.call_args.kwargs["timeout"] == 30.0
+    assert ctor.call_args.kwargs["max_retries"] == 0
+
+
+def test_empty_directory_and_recovery(tmp_path):
+    with patch.object(agent, "KNOWLEDGE_DIR", tmp_path):
+        assert agent.safe_retrieve_knowledge([], [])[1]["status"] == "read_failed"
+        (tmp_path / "code_quality.md").write_text("# Example Rules\n- Check code quality", encoding="utf-8")
+        context, status = agent.safe_retrieve_knowledge([], [])
+        assert status["status"] == "success"
+        assert "Check code quality" in context
+        (tmp_path / "code_quality.md").unlink()
+        assert agent.safe_retrieve_knowledge([], [])[1]["status"] == "read_failed"
+
+
+def test_real_sdk_timeout_at_completion_preserves_static(baseline):
+    from openai import APITimeoutError
+    timeout = APITimeoutError(request=SimpleNamespace(method="POST", url="https://example.invalid"))
+    client = client_returning()
+    client.chat.completions.create = lambda **kwargs: None
+    with patch.object(client.chat.completions, "create", side_effect=timeout), \
+         patch.object(agent, "get_client", return_value=client):
+        state = run_pipeline()
+    assert_static_preserved(state, baseline)
+    assert state.enhancement_status["ai"]["status"] == "timeout"
+
+
+def test_ai_page_and_refresh_render_without_knowledge(baseline, tmp_path):
+    from streamlit.testing.v1 import AppTest
+    at = AppTest.from_file(str(ROOT / "app.py"), default_timeout=20)
+    for key, value in vars(baseline).items():
+        at.session_state[key] = value
+    at.session_state["active_page"] = "AI Review"
+    with patch.object(agent, "KNOWLEDGE_DIR", tmp_path / "absent"), \
+         patch.object(agent, "get_client", side_effect=TimeoutError("private payload")):
+        at.run()
+        assert not at.exception
+        button = next(b for b in at.button if b.label == "Generate / refresh AI Review")
+        button.click().run()
+        assert not at.exception
+    assert at.session_state["enhancement_status"]["knowledge"]["status"] == "read_failed"
+    assert at.session_state["enhancement_status"]["ai"]["status"] == "timeout"
+    assert at.session_state["code_result"] == baseline.code_result
+    assert at.session_state["report_pdf"].startswith(b"%PDF")
+    assert any("超时" in w.value for w in at.warning)

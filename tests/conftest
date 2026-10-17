@@ -1,0 +1,36 @@
+"""Offline regression: never load a local secret or send a paid model request."""
+import os
+from unittest.mock import patch
+
+# Set before test-module collection imports agent/app and their load_dotenv().
+os.environ["PYTHON_DOTENV_DISABLED"] = "1"
+
+import socket
+import dotenv
+import pytest
+
+# Older python-dotenv versions do not recognize PYTHON_DOTENV_DISABLED.
+# Patch before collecting modules so no supported version reads .env files.
+_dotenv_guard = patch.object(dotenv, "load_dotenv", return_value=False)
+_dotenv_guard.start()
+
+
+def pytest_unconfigure(config):
+    _dotenv_guard.stop()
+
+
+@pytest.fixture(autouse=True)
+def offline_model_transport(monkeypatch):
+    """Unexpected SDK traffic fails even when the application catches the error."""
+    attempts = []
+
+    def blocked(*args, **kwargs):
+        attempts.append(True)
+        raise AssertionError("Regression tests require a mocked HTTP transport")
+
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "regression-placeholder-not-a-key")
+    # Transport independent: SDK versions can use different HTTP libraries.
+    monkeypatch.setattr(socket.socket, "connect", blocked)
+    monkeypatch.setattr(socket.socket, "connect_ex", blocked)
+    yield
+    assert not attempts, "An unmocked HTTP request was blocked; fix the test's mock"

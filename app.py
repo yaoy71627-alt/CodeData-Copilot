@@ -10,8 +10,8 @@ import streamlit as st
 
 from agent import (
     build_repair_suggestions,
-    load_knowledge_documents,
-    retrieve_relevant_knowledge,
+    safe_retrieve_knowledge,
+    classify_ai_error,
     run_agent,
 )
 from code_analyzer import (
@@ -34,6 +34,8 @@ from consistency_validator import (
     build_analysis_facts,
     validate_agent_consistency,
     validate_report_consistency,
+    is_final_report,
+    conclusion_summary_lines,
 )
 from file_loader import decode_python_file, materialize_project_uploads, materialize_uploads
 from github_loader import load_github_project
@@ -70,6 +72,7 @@ def init_state():
         "code_result": None,
         "data_result": None,
         "agent_report": None,
+        "enhancement_status": {},
         "analysis_error": None,
         "analyzed_files": None,
         "data_results": [],
@@ -88,6 +91,7 @@ def init_state():
         "repair_suggestions": [],
         "patch_text": "",
         "report_data": None,
+        "report_export_fingerprint": None,
         "report_markdown": None,
         "report_pdf": None,
         "report_error": None,
@@ -285,8 +289,14 @@ def analyze_project_files(files, generate_ai=True, project_metadata=None, progre
     }
 
     notify(3, "running")
-    relevant_knowledge = retrieve_relevant_knowledge(code_result, data_results, project_context)
-    notify(3, "complete", f"已选择 {relevant_knowledge.count('- ')} 条相关审查准则")
+    relevant_knowledge, knowledge_status = safe_retrieve_knowledge(code_result, data_results, project_context)
+    enhancement_status = {"knowledge": knowledge_status, "ai": {
+        "status": "disabled", "reason": "本次未启用 AI Review。", "used_knowledge": False,
+    }}
+    notify(3, "complete" if knowledge_status["status"] in {"success", "empty"} else "error",
+           knowledge_status["reason"])
+    if knowledge_status["status"] != "success":
+        warnings.append(knowledge_status["reason"])
 
     agent_report = None
     agent_error = None
@@ -304,9 +314,15 @@ def analyze_project_files(files, generate_ai=True, project_metadata=None, progre
                 agent_report, analysis_facts
             )
             warnings.extend(consistency_notes)
+            enhancement_status["ai"] = {
+                "status": "success", "reason": "Qwen Review 已生成。",
+                "used_knowledge": bool(relevant_knowledge),
+            }
             notify(4, "complete", "Qwen Review 已生成")
         except Exception as exc:
-            agent_error = str(exc)
+            enhancement_status["ai"] = {**classify_ai_error(exc), "used_knowledge": False}
+            agent_error = enhancement_status["ai"]["reason"]
+            warnings.append(agent_error)
             notify(4, "error", "AI Review 未生成，基础分析仍可使用")
     else:
         notify(4, "complete", "本次未启用 AI Review")
@@ -326,6 +342,7 @@ def analyze_project_files(files, generate_ai=True, project_metadata=None, progre
         patch_text,
         health,
         analysis_facts=analysis_facts,
+        enhancement_status=enhancement_status,
     )
     report_data = validate_report_consistency(report_data)
     report_markdown = build_markdown_report(report_data)
@@ -346,6 +363,7 @@ def analyze_project_files(files, generate_ai=True, project_metadata=None, progre
     st.session_state.quantified_impacts = quantified_impacts
     st.session_state.artifact_analysis = artifact_analysis
     st.session_state.data_result = data_results[0]["result"] if data_results else None
+    st.session_state.enhancement_status = enhancement_status
     st.session_state.agent_report = agent_report
     st.session_state.analysis_error = agent_error
     st.session_state.analysis_warnings = warnings
@@ -365,12 +383,13 @@ def analyze_project_files(files, generate_ai=True, project_metadata=None, progre
         "documentation": f"{len(documentation_names)} 个 Markdown 文件",
     }
     st.session_state.import_source = (project_metadata or {}).get("source", "Analysis pipeline")
-    st.session_state.repair_suggestions = repair_suggestions
-    st.session_state.patch_text = patch_text
+    st.session_state.repair_suggestions = report_data["repair_suggestions"]
+    st.session_state.patch_text = report_data["patch_text"]
     st.session_state.report_data = report_data
     st.session_state.report_markdown = report_markdown
     st.session_state.report_pdf = report_pdf
     st.session_state.report_error = report_error
+    st.session_state.report_export_fingerprint = report_data["final_fingerprint"]
     st.session_state.last_analyzed_at = datetime.now().strftime("%Y-%m-%d %H:%M")
     notify(6, "complete")
 
@@ -454,6 +473,34 @@ def run_with_analysis_status(operation):
             raise
 
 
+def refresh_ai_review():
+    """Refresh enhancement only; static evidence and repairs stay intact on failure."""
+    context, knowledge_status = safe_retrieve_knowledge(
+        st.session_state.code_result, st.session_state.data_results,
+        st.session_state.project_context,
+    )
+    status = {"knowledge": knowledge_status}
+    try:
+        review = run_agent(
+            st.session_state.code_result, st.session_state.data_results,
+            st.session_state.project_context, knowledge_context=context,
+            analysis_facts=st.session_state.analysis_facts,
+        )
+        review, notes = validate_agent_consistency(review, st.session_state.analysis_facts or {})
+        st.session_state.analysis_warnings.extend(notes)
+        st.session_state.agent_report = review
+        st.session_state.analysis_error = None
+        status["ai"] = {"status": "success", "reason": "Qwen Review 已生成。",
+                        "used_knowledge": bool(context)}
+    except Exception as exc:
+        status["ai"] = {**classify_ai_error(exc), "used_knowledge": False}
+        st.session_state.analysis_error = status["ai"]["reason"]
+        # Preserve the previous review, but explicitly mark it as historical.
+        status["ai"]["previous_review_retained"] = bool(st.session_state.agent_report)
+    st.session_state.enhancement_status = status
+    rebuild_session_report()
+
+
 def rebuild_session_report():
     """Refresh all report formats after an AI Review is regenerated."""
     suggestions = st.session_state.repair_suggestions or build_repair_suggestions(
@@ -464,7 +511,7 @@ def rebuild_session_report():
     suggestions = validate_repair_suggestions(
         suggestions, st.session_state.data_flow, st.session_state.data_results
     )
-    patch_text = st.session_state.patch_text or build_unified_patch(suggestions)
+    patch_text = build_unified_patch(suggestions)
     report_data = build_report_data(
         st.session_state.project_overview,
         st.session_state.code_result,
@@ -474,39 +521,67 @@ def rebuild_session_report():
         patch_text,
         st.session_state.health,
         analysis_facts=st.session_state.analysis_facts,
+        enhancement_status=st.session_state.enhancement_status,
     )
     report_data = validate_report_consistency(report_data)
-    st.session_state.report_data = report_data
-    st.session_state.report_markdown = build_markdown_report(report_data)
+    publish_final_report(report_data)
+
+
+def publish_final_report(report):
+    """Publish one finalized object and bind both exported formats to its revision."""
+    report = validate_report_consistency(report)
+    st.session_state.report_data = report
+    st.session_state.repair_suggestions = report["repair_suggestions"]
+    st.session_state.patch_text = report["patch_text"]
+    st.session_state.report_markdown = build_markdown_report(report)
     st.session_state.report_error = None
     try:
-        st.session_state.report_pdf = build_pdf_report(report_data)
+        st.session_state.report_pdf = build_pdf_report(report)
     except Exception as exc:
         st.session_state.report_pdf = None
         st.session_state.report_error = str(exc)
+    st.session_state.report_export_fingerprint = report["final_fingerprint"]
+
+
+def current_report():
+    if st.session_state.analyzed_files is None:
+        return {}
+    report = st.session_state.report_data
+    if not is_final_report(report):
+        if report and report.get("schema_version") == "final-report-v1":
+            publish_final_report(report)
+        else:
+            rebuild_session_report()
+        report = st.session_state.report_data
+    if st.session_state.report_export_fingerprint != report["final_fingerprint"]:
+        publish_final_report(report)
+    return st.session_state.report_data
+
+
+def final_view(key, default=None):
+    return current_report().get("view", {}).get(key, default)
 
 
 def require_results():
     if st.session_state.analyzed_files is None:
         st.info("请先在 Project Import 页面上传文件或导入 GitHub 仓库，并运行分析。")
         return False
+    report = current_report()
+    for line in conclusion_summary_lines(report):
+        st.caption(line)
     return True
 
 
 def render_summary():
-    reports = [item["result"] for item in st.session_state.data_results]
-    code_count = summarize_results(st.session_state.code_result, None)["code_issue_count"]
-    data_count = sum(len(build_data_issues(result)) for result in reports)
-    stats = st.session_state.project_stats or {
-        "files": len(reports), "code_files": 0, "data_files": len(reports),
-        "documentation_files": 0,
-    }
-    score = st.session_state.health["score"] if st.session_state.health else 0
+    overview = current_report()["project_overview"]
+    stats = {"files": overview.get("file_count", 0), "code_files": overview.get("python_file_count", 0),
+             "data_files": overview.get("data_file_count", 0)}
+    score = final_view("health", {})["score"] if final_view("health", {}) else 0
     items = (
         ("Overall", f"{score}/100", "primary"),
         ("Code", str(stats["code_files"]), "neutral"),
         ("Data", str(stats["data_files"]), "teal"),
-        ("Issues", str(code_count + data_count), "warning"),
+        ("Issues", str(current_report()["conclusions"]["counts"]["total"]), "warning"),
         ("Files", str(stats["files"]), "neutral"),
     )
     cells = "".join(
@@ -534,7 +609,11 @@ def issue_table(issues, include_file=False):
     rows = []
     for issue in issues or []:
         row = {
-            "Severity": str(issue.get("severity", "Low")).upper(),
+            "ID": issue.get("id", "—"),
+            "Problem ID": issue.get("problem_id", "—"),
+            "Verification": issue.get("verification_label", "需要人工复核"),
+            "Cell": issue.get("cell") if issue.get("cell") is not None else "—",
+            "Severity": str(issue.get("severity", "Unspecified")),
             "Confidence": issue.get("confidence", "Medium"),
             "Nature": issue.get("issue_nature", "Needs Review"),
             "Origin": issue.get("issue_origin", "Analyzer rule"),
@@ -559,7 +638,7 @@ def issue_table(issues, include_file=False):
 
 def render_project_health_panel():
     """Render the existing static score as a compact project-health focal point."""
-    health = st.session_state.health or {}
+    health = final_view("health", {}) or {}
     if not health:
         return
 
@@ -570,14 +649,8 @@ def render_project_health_panel():
     code_quality = max(0, min(100, code_quality))
     data_quality = max(0, min(100, data_quality))
 
-    code_issues = summarize_results(st.session_state.code_result, None)["code_issue_count"]
-    repair_count = len(st.session_state.repair_suggestions or [])
-    if code_issues == 0 or repair_count >= code_issues:
-        repairability, repair_value = "High", 92
-    elif repair_count:
-        repairability, repair_value = "Medium", 64
-    else:
-        repairability, repair_value = "Low", 28
+    patch_available = current_report()["conclusions"]["patch_available"]
+    repairability, repair_value = ("Available", 100) if patch_available else ("Not generated", 0)
 
     if score >= 80:
         project_status, risk_level, risk_value, risk_tone = "HEALTHY", "Low", 24, "teal"
@@ -590,7 +663,7 @@ def render_project_health_panel():
         ("Code Quality", f"{code_quality}", code_quality, "blue"),
         ("Data Quality", f"{data_quality}", data_quality, "teal"),
         ("Risk Level", risk_level, risk_value, risk_tone),
-        ("Repairability", repairability, repair_value, "teal"),
+        ("Patch status", repairability, repair_value, "teal"),
     )
     signal_rows = "".join(
         '<div class="health-signal">'
@@ -706,8 +779,8 @@ def render_sidebar_navigation():
             unsafe_allow_html=True,
         )
         if st.session_state.analyzed_files:
-            overview = st.session_state.project_overview or {}
-            score = (st.session_state.health or {}).get("score", 0)
+            overview = final_view("project_overview", {}) or {}
+            score = (final_view("health", {}) or {}).get("score", 0)
             st.markdown(
                 '<div class="sidebar-project">'
                 '<span class="sidebar-label">CURRENT PROJECT</span>'
@@ -737,7 +810,7 @@ def render_sidebar_navigation():
 
 
 def render_health_breakdown():
-    health = st.session_state.health
+    health = final_view("health", {})
     if not health:
         return
     score_col, progress_col = st.columns([1, 3])
@@ -752,10 +825,10 @@ def render_health_breakdown():
 
 
 def render_overview_details():
-    overview = st.session_state.project_overview or {}
+    overview = final_view("project_overview", {}) or {}
     if not overview:
         return
-    stats = st.session_state.project_stats or {}
+    stats = {"files": overview.get("file_count", 0), "data_files": overview.get("data_file_count", 0)}
     last_analyzed = st.session_state.last_analyzed_at or "This session"
     st.markdown(
         '<div class="project-identity">'
@@ -952,7 +1025,7 @@ if page == "Home":
         st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
         render_overview_details()
         with st.expander("评分依据", expanded=False):
-            for explanation in (st.session_state.health or {}).get("explanation", []):
+            for explanation in (final_view("health", {}) or {}).get("explanation", []):
                 st.write("• " + explanation)
 
 
@@ -963,11 +1036,12 @@ elif page == "Data Quality":
         "检查完整性、非有限值、统计极端值、类型一致性、类别质量与特征冗余。",
     )
     if require_results():
-        if not st.session_state.data_results:
+        if not final_view("data_results", []):
             st.info("此项目没有可分析的 CSV 文件。")
             st.stop()
-        choices = {entry["file"]: entry["result"] for entry in st.session_state.data_results}
-        result = choices[st.selectbox("选择 CSV 文件", list(choices))]
+        choices = {entry["file"]: entry["result"] for entry in final_view("data_results", [])}
+        selected_file = st.selectbox("选择 CSV 文件", list(choices))
+        result = choices[selected_file]
 
         shape = result.get("shape", {})
         column_count = shape.get("columns", 0)
@@ -977,7 +1051,7 @@ elif page == "Data Quality":
         )
         data_issues = result.get("issues") or build_data_issues(result)
         outlier_count = sum(item.get("count") or 0 for item in result.get("outliers", []))
-        quality_score = issue_quality_score(data_issues)
+        quality_score = next(d["quality_score"] for d in current_report()["data_quality"]["datasets"] if d["file"] == selected_file)
         metric_rows, metric_columns, metric_missing, metric_duplicates, metric_outliers, metric_quality = st.columns(6)
         metric_rows.metric("Rows", f"{shape.get('rows', 0):,}", help="CSV 数据记录数")
         metric_columns.metric("Columns", column_count, help="数据字段数量")
@@ -998,7 +1072,7 @@ elif page == "Data Quality":
 
         with tab_issues:
             combined_issues = list(data_issues)
-            combined_issues.extend(st.session_state.data_consistency_issues or [])
+            combined_issues.extend(final_view("data_consistency_issues", []) or [])
             if combined_issues:
                 st.dataframe(issue_table(combined_issues), width="stretch", hide_index=True)
                 st.caption("Potential / Suspicious 结论需要业务或统计复核；系统不会自动修改原始数据。")
@@ -1105,8 +1179,8 @@ elif page == "Code Analysis":
         "按严重性、文件和行号审阅 AST 静态证据；展开条目查看原因与建议。",
     )
     if require_results():
-        result = st.session_state.code_result or []
-        flow = st.session_state.data_flow or {}
+        result = final_view("code_result", []) or []
+        flow = final_view("data_flow", {}) or {}
         with st.expander("Data Flow Summary", expanded=False):
             st.code(flow_summary_text(flow), language=None)
             flow_left, flow_middle, flow_right = st.columns(3)
@@ -1139,7 +1213,7 @@ elif page == "Code Analysis":
                     "Fairness: " + fairness.get("coverage", "Evaluation detected")
                     + f" · before/after={fairness.get('before_after_comparison', False)}"
                 )
-        artifact_analysis = st.session_state.artifact_analysis or {}
+        artifact_analysis = final_view("artifact_analysis", {}) or {}
         if artifact_analysis.get("groups"):
             with st.expander("Duplicate / Near-Duplicate Analysis Artifacts", expanded=False):
                 for group in artifact_analysis["groups"]:
@@ -1150,13 +1224,13 @@ elif page == "Code Analysis":
                     st.caption("Affected files: " + ", ".join(group.get("files", [])))
                     for duplicate in group.get("files", [])[1:]:
                         st.caption(f"{duplicate} · Duplicate of {group.get('primary')}")
-        issue_count = summarize_results(result, st.session_state.data_result)["code_issue_count"]
-        score = (st.session_state.health or {}).get("breakdown", {}).get("代码质量", 0)
+        issue_count = summarize_results(result, final_view("data_result", None))["code_issue_count"]
+        score = (final_view("health", {}) or {}).get("breakdown", {}).get("代码质量", 0)
         quality_score = round((score / 35) * 100) if score else 0
         affected_files = len({location.get("file", "Python 文件") for location in result})
         metric_left, metric_middle, metric_right = st.columns([1.3, 1, 1])
         metric_left.metric("Code Quality Score", f"{quality_score}/100")
-        metric_middle.metric("Detected Risks", issue_count)
+        metric_middle.metric("Code findings", current_report()["code_quality"]["issue_count"])
         metric_right.metric("Affected Files", affected_files)
         st.progress(quality_score / 100)
         st.caption("Code Quality Score 来自现有静态评分的 100 分制展示，不代表代码运行结果。")
@@ -1164,9 +1238,7 @@ elif page == "Code Analysis":
         if not result:
             st.success("当前规则下未发现明显代码问题。")
         else:
-            repair_items = build_repair_suggestions(
-                result, st.session_state.data_flow, st.session_state.data_results
-            )
+            repair_items = current_report()["repair_suggestions"]
             st.write("")
             flat_issues = []
             for location in result:
@@ -1174,11 +1246,11 @@ elif page == "Code Analysis":
                 if "cell" in location:
                     label += f" · Notebook Cell {location['cell']}"
                 for issue in location.get("issues", []):
-                    flat_issues.append({**issue, "file": label})
+                    flat_issues.append({**issue, "file": location.get("file", "Python 文件")})
             st.markdown('<div class="section-label">ISSUE INDEX</div>', unsafe_allow_html=True)
             issue_index_df = issue_table(flat_issues, include_file=True)
             issue_index_df = issue_index_df[
-                ["Severity", "Confidence", "Category", "Issue", "Affected Files", "Line"]
+                ["ID", "Problem ID", "Severity", "Confidence", "Verification", "Issue", "File", "Cell", "Line", "Evidence"]
             ]
             st.dataframe(
                 issue_index_df,
@@ -1202,11 +1274,13 @@ elif page == "Code Analysis":
                 for issue in location.get("issues", []):
                     issue_index += 1
                     issue_type = issue.get("type", "代码问题")
-                    severity = str(issue.get("severity", "Low")).upper()
+                    severity = str(issue.get("severity", "Unspecified"))
                     confidence = issue.get("confidence", "Medium")
                     category = issue.get("category", "Code Quality")
                     repair = next(
-                        (item for item in repair_items if item.get("problem") == issue_type),
+                        (item for item in repair_items if item.get("problem") == issue_type
+                         and item.get("file") == location.get("file")
+                         and item.get("cell") == location.get("cell") and item.get("line") == issue.get("line")),
                         None,
                     )
                     reason = issue.get("message", "暂无说明")
@@ -1219,7 +1293,7 @@ elif page == "Code Analysis":
                     )
                     affected = issue.get("affected_files") or location.get("affected_files") or [location.get("file", "Python 文件")]
                     with st.expander(
-                        f"{issue_index:02d}  ·  {severity}  ·  {confidence} confidence  ·  {issue_type}  ·  {issue_location}"
+                        f"{issue.get('id', issue_index)}  ·  {issue.get('verification_label', '需要人工复核')}  ·  {severity}  ·  {confidence} confidence  ·  {issue_type}  ·  {issue_location}"
                     ):
                         st.markdown(
                             '<div class="finding-detail">'
@@ -1256,18 +1330,14 @@ elif page in ("AI Review", "Repair"):
         )
     if require_results():
         if page == "Repair":
-            suggestions = st.session_state.repair_suggestions or build_repair_suggestions(
-                st.session_state.code_result,
-                st.session_state.data_flow,
-                st.session_state.data_results,
-            )
-            patch_text = st.session_state.patch_text or build_unified_patch(suggestions)
+            suggestions = current_report()["repair_suggestions"]
+            patch_text = current_report()["patch_text"]
             render_repair_flow()
             metric_a, metric_b, metric_c = st.columns(3)
             metric_a.metric("Repair suggestions", len(suggestions))
             metric_b.metric(
                 "Validation passed",
-                sum(item.get("validation_status") in {"Fully Validated", "Syntax Valid"} for item in suggestions),
+                sum(item.get("validation_status") in {"Statically Validated", "Runtime Verified"} for item in suggestions),
             )
             metric_c.metric("Project modified", "No")
 
@@ -1324,23 +1394,28 @@ elif page in ("AI Review", "Repair"):
                     disabled=not confirmed,
                 )
             elif suggestions:
-                st.warning("检测到了修复建议，但缺少真实原始代码片段，因此没有生成可能误导的 Patch。")
+                st.warning(current_report()["conclusions"]["patch_status"] + "；最终修复状态：" + "、".join(sorted({item.get("validation_status", "Recommendation Only") for item in suggestions})) + "。")
 
-            if st.session_state.agent_report:
+            if final_view("agent_report", None):
                 with st.expander("AI Review 中的补充修复说明"):
-                    st.markdown(st.session_state.agent_report)
+                    st.markdown(final_view("agent_report", None))
         else:
-            suggestions = st.session_state.repair_suggestions or build_repair_suggestions(
-                st.session_state.code_result,
-                st.session_state.data_flow,
-                st.session_state.data_results,
-            )
-            reports = [item["result"] for item in st.session_state.data_results]
+            suggestions = current_report()["repair_suggestions"]
+            reports = [item["result"] for item in final_view("data_results", [])]
             data_issues = [issue for report in reports for issue in build_data_issues(report)]
             summary_left, summary_middle, summary_right = st.columns(3)
-            summary_left.metric("Detected problems", len(suggestions) + len(data_issues))
-            summary_middle.metric("Knowledge coverage", f"{len(load_knowledge_documents())} topics")
-            summary_right.metric("Qwen review", "Ready" if st.session_state.agent_report else "Not generated")
+            summary_left.metric("Detected problems", current_report()["conclusions"]["counts"]["total"])
+            knowledge_status = final_view("enhancement_status", {}).get("knowledge", {})
+            summary_middle.metric("Knowledge coverage", f"{len(knowledge_status.get('sources', []))} topics")
+            if knowledge_status:
+                st.caption(knowledge_status["reason"])
+            ai_status = final_view("enhancement_status", {}).get("ai", {})
+            summary_right.metric("Qwen review", ai_status.get("status") or
+                                 ("Ready" if final_view("agent_report", None) else "Not generated"))
+            if st.session_state.analysis_error:
+                st.warning(st.session_state.analysis_error)
+                if ai_status.get("previous_review_retained"):
+                    st.caption("下方保留上次成功生成的 AI Review；本次刷新未完成。")
 
             if suggestions or data_issues:
                 with st.expander("Static evidence", expanded=False):
@@ -1351,8 +1426,8 @@ elif page in ("AI Review", "Repair"):
                         st.markdown(f"**Data · {issue['problem']}**")
                         st.write(issue["detail"])
 
-            if st.session_state.agent_report:
-                sections = split_agent_report(st.session_state.agent_report)
+            if final_view("agent_report", None):
+                sections = split_agent_report(final_view("agent_report", None))
                 panel_map = (
                     ("Summary", sections.get(1, "暂无项目总结。")),
                     ("Key Findings", "\n\n".join(filter(None, (sections.get(2), sections.get(3))))),
@@ -1368,34 +1443,18 @@ elif page in ("AI Review", "Repair"):
                     )
                     st.markdown(content or "暂无内容。")
             elif st.session_state.analysis_error:
-                st.warning(f"AI Review 未生成：{st.session_state.analysis_error}")
+                st.info("静态诊断仍然有效，可重试 AI Review。")
             else:
                 st.info("本次分析尚未调用 Qwen Agent。静态诊断仍然有效，可在下方生成 Review。")
 
             if st.button("Generate / refresh AI Review", type="primary"):
-                try:
-                    with st.status("正在生成知识增强 Review", expanded=True) as review_status:
-                        knowledge_context = retrieve_relevant_knowledge(
-                            st.session_state.code_result,
-                            st.session_state.data_results,
-                            st.session_state.project_context,
-                        )
-                        st.write("✓ 已选择相关质量准则")
-                        st.session_state.agent_report = run_agent(
-                            st.session_state.code_result,
-                            st.session_state.data_results,
-                            st.session_state.project_context,
-                            knowledge_context=knowledge_context,
-                        )
-                        st.write("✓ Qwen Review 已生成")
-                        rebuild_session_report()
-                        st.write("✓ 报告已同步更新")
+                with st.status("正在生成 Review", expanded=True) as review_status:
+                    refresh_ai_review()
+                    if st.session_state.analysis_error:
+                        review_status.update(label=st.session_state.analysis_error, state="error")
+                    else:
                         review_status.update(label="AI Review 已更新", state="complete", expanded=False)
-                    st.session_state.analysis_error = None
-                    st.rerun()
-                except Exception as exc:
-                    st.session_state.analysis_error = str(exc)
-                    st.error(f"Agent 调用失败：{exc}")
+                st.rerun()
 
         st.divider()
         st.caption(
@@ -1411,9 +1470,7 @@ elif page == "Report":
         "预览并导出同源的 Markdown 与 PDF 审查报告。",
     )
     if require_results():
-        if not st.session_state.report_data:
-            rebuild_session_report()
-        report = st.session_state.report_data or {}
+        report = current_report()
         overview = report.get("project_overview", {})
         safe_project_name = re.sub(
             r"[^A-Za-z0-9._-]+", "-", overview.get("project_name", "project")

@@ -123,7 +123,12 @@ class UpgradeTests(unittest.TestCase):
                 [],
                 {"project_files": ["model.py"], "user_code_context": "model training"},
             )
-        self.assertEqual(result, "修复建议")
+        # A non-JSON model response must now retain canonical findings and explain
+        # the format failure, rather than returning arbitrary model Markdown.
+        self.assertIn("Data Leakage Risk", result)
+        self.assertIn("静态分析风险", result)
+        self.assertIn("未返回有效的结构化解释", result)
+        self.assertEqual(captured["response_format"], {"type": "json_object"})
         self.assertIn("scaler.fit_transform(X)", captured["messages"][1]["content"])
         self.assertIn("Data Leakage Prevention", captured["messages"][1]["content"])
         self.assertIn("model.py", captured["messages"][1]["content"])
@@ -138,7 +143,10 @@ class UpgradeTests(unittest.TestCase):
         self.assertEqual(len(suggestions), 1)
         self.assertIsNone(suggestions[0]["original_code"])
         self.assertIsNone(suggestions[0]["corrected_code"])
-        self.assertIn("X_test = scaler.transform(X_test)", suggestions[0]["conceptual_code"])
+        # Do not publish a generic template referencing unavailable variables.
+        self.assertIsNone(suggestions[0]["conceptual_code"])
+        self.assertTrue(suggestions[0]["requires_multi_location"])
+        self.assertIn("Recommendation Only", suggestions[0]["explanation"])
         self.assertTrue(suggestions[0]["requires_confirmation"])
 
     def test_patch_export_is_unified_diff_and_never_edits_source(self):

@@ -245,8 +245,12 @@ model_data = model_data.dropna()
         suggestions = validate_repair_suggestions(suggestions, flow, data_results)
         missing = next(item for item in suggestions if item["problem"] == "Missing Value Handling Risk")
         self.assertNotIn("Cabin", missing.get("after_code") or "")
-        self.assertIn("Age", missing.get("after_code") or "")
-        self.assertIn(missing["validation_status"], {"Statically Validated", "API Unverified", "Syntax Valid Only"})
+        # Whole-frame median/mode substitution is not a safe complete repair:
+        # it may fit on test data and changes row/sample alignment.
+        self.assertIn("Age", missing["referenced_columns"])
+        self.assertNotIn("Cabin", missing["referenced_columns"])
+        self.assertIsNone(missing.get("after_code"))
+        self.assertEqual(missing["validation_status"], "Recommendation Only")
 
     def test_issue_nature_does_not_mark_rare_categories_as_fix(self):
         values = ["common"] * 199 + ["rare"]

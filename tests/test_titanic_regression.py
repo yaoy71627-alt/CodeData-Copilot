@@ -262,7 +262,9 @@ X_train, X_test = train_test_split(X_scaled, test_size=0.2, random_state=1)
         self.assertIn("Cabin", markdown)
         self.assertIn("Cross-split duplicate groups (model_input_row): 9", markdown)
         self.assertTrue(pdf.startswith(b"%PDF"))
-        self.assertIn(b"STSong-Light", pdf)
+        # A named CID font alone does not guarantee readable Chinese.
+        self.assertIn(b"/FontFile2", pdf)
+        self.assertIn(b"NotoSansSC", pdf)
 
 
 if __name__ == "__main__":

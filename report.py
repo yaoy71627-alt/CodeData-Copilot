@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from copy import deepcopy
 from io import BytesIO
+from pathlib import Path
 import re
 from xml.sax.saxutils import escape
 
 from data_flow_analyzer import flow_summary_text
+from consistency_validator import (build_findings, render_finding_evidence, coverage_for_review, coverage_summary, ensure_review_coverage, legacy_data_issues, validate_report_consistency, conclusion_summary_lines, finding_summary_line, ReviewText)
 
 
 def count_code_issues(code_result):
@@ -35,46 +38,7 @@ def build_data_issues(data_result):
             for issue in canonical
         ]
 
-    issues = []
-
-    for column, rate in data_result.get("missing_values", {}).items():
-        level = "High" if rate >= 0.5 else "Medium" if rate >= 0.1 else "Low"
-        issues.append({
-            "level": level,
-            "severity": level,
-            "confidence": "High",
-            "rule_id": "DQ_MISSING_VALUES",
-            "category": "Missing Values",
-            "type": "Missing Values",
-            "column": column,
-            "problem": f"{column} 存在缺失值",
-            "detail": f"缺失率为 {rate:.2%}",
-            "message": f"{column} 存在缺失值",
-            "evidence": f"缺失率为 {rate:.2%}",
-            "recommendation": "结合缺失机制选择处理策略。",
-        })
-
-    duplicate_rows = data_result.get("duplicate_rows", 0)
-    if duplicate_rows:
-        issues.append({
-            "level": "Medium",
-            "severity": "Medium",
-            "confidence": "High",
-            "rule_id": "DQ_DUPLICATE_ROWS",
-            "category": "Duplicates",
-            "type": "Potential Duplicate Records",
-            "column": None,
-            "problem": "存在重复样本",
-            "detail": (
-                f"发现 {duplicate_rows} 条重复记录，"
-                f"占全部样本的 {data_result.get('duplicate_rate', 0):.2%}"
-            ),
-            "message": "存在内容完全相同的重复记录。",
-            "evidence": f"发现 {duplicate_rows} 条重复记录。",
-            "recommendation": "核对业务主键和重复来源；不要自动删除。",
-        })
-
-    return issues
+    return legacy_data_issues(data_result)
 
 
 def summarize_results(code_result, data_result):
@@ -117,8 +81,14 @@ def build_report_data(
     patch_text,
     health,
     analysis_facts=None,
+    enhancement_status=None,
 ):
     """Build the single data model consumed by every report format."""
+    structured_review = isinstance(agent_report, ReviewText)
+    findings = build_findings(code_result, data_results)
+    facts = dict(analysis_facts or {})
+    facts["findings"] = findings
+    agent_report = ensure_review_coverage(agent_report or "本次分析未生成 Qwen AI Review；静态分析结论仍然有效。", facts)
     overview = dict(project_overview or {})
     repairs = list(repair_suggestions or [])
     code_issues = []
@@ -200,7 +170,8 @@ def build_report_data(
         issue for issue in code_issues
         if issue.get("score_impact") != 0 and issue.get("action") != "Informational"
     ]
-    return {
+    report = {
+        "source_snapshot": {"code_result": deepcopy(code_result or []), "data_results": deepcopy(data_results or []), "structured_review": structured_review, "overview": deepcopy(overview), "health": deepcopy(health)},
         "title": "CodeData-Copilot Analysis Report",
         "generated_at": datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M %Z"),
         "project_overview": overview,
@@ -216,16 +187,46 @@ def build_report_data(
                 issue for entry in data_results or [] for issue in entry.get("project_issues", [])
             ],
         },
+        "findings": findings,
+        "review_coverage": coverage_for_review(agent_report, findings),
+        "enhancement_status": dict(enhancement_status or {}),
         "ai_review": agent_report or "本次分析未生成 Qwen AI Review；静态分析结论仍然有效。",
         "repair_suggestions": repairs,
         "patch_text": patch_text or "",
         "overall": health,
-        "analysis_facts": dict(analysis_facts or {}),
+        "analysis_facts": facts,
     }
+
+    return validate_report_consistency(report)
+
+
+def report_coverage_summary(report):
+    summary = coverage_summary(report.get("review_coverage") or coverage_for_review(report["ai_review"], report.get("findings", [])))
+    return "" if summary in report["ai_review"] else summary
+
+
+def enhancement_summary(report):
+    """Shared audit text for Markdown and PDF exports."""
+    status = report.get("enhancement_status", {})
+    if not status:
+        return "增强状态：未记录（旧版分析记录）。"
+    knowledge, ai = status.get("knowledge", {}), status.get("ai", {})
+    lines = [
+        "增强功能状态（静态诊断独立保留）：",
+        f"知识库：{knowledge.get('status', 'unknown')}；{knowledge.get('reason', '')}",
+        f"AI Review：{ai.get('status', 'unknown')}；{ai.get('reason', '')}",
+        "知识库用于本次 AI Review：" + ("是" if ai.get("used_knowledge") else "否"),
+    ]
+    if ai.get("previous_review_retained"):
+        lines.append("本次刷新失败；以下 AI Review 为上次成功结果，不代表本次生成。")
+    lines.append("检索采用的来源：" + ("、".join(knowledge.get("sources", [])) or "无"))
+    lines.extend("采用准则：" + rule for rule in knowledge.get("rules", []))
+    return "\n\n".join(lines)
 
 
 def build_markdown_report(report):
     """Render a GitHub-friendly report from canonical report data."""
+    report = validate_report_consistency(report)
     overview = report["project_overview"]
     code = report["code_quality"]
     datasets = report["data_quality"]["datasets"]
@@ -247,10 +248,13 @@ def build_markdown_report(report):
         "## 2. Code Quality Analysis",
         "",
         f"- 代码质量评分：{code['score']}/100",
-        f"- 问题数量：{code['issue_count']}",
+        f"- 需处理的代码条目（不含 Informational）：{code['issue_count']}",
         f"- Informational notebook/scope notices: {code.get('informational_count', 0)}",
         "",
     ]
+    lines.extend(["### 最终结论与问题清单", "", *conclusion_summary_lines(report), ""])
+    lines.extend("- " + finding_summary_line(issue) for issue in report["conclusions"]["finding_rows"])
+    lines.append("")
     facts = report.get("analysis_facts", {})
     flow = facts.get("data_flow", {})
     task = facts.get("task_type", {})
@@ -359,6 +363,8 @@ def build_markdown_report(report):
             lines.extend([
                 f"### 2.{index} {issue['type']}",
                 "",
+                f"- 问题编号：{issue['id']} / {issue['problem_id']}",
+                f"- 验证状态：{issue['verification_label']}",
                 f"- 严重程度：{issue['severity']}",
                 f"- 置信度：{issue.get('confidence', 'Medium')}",
                 f"- Classification: {issue.get('action', 'Review')}",
@@ -496,21 +502,14 @@ def build_markdown_report(report):
             )
         lines.append("")
 
-    all_data_issues = [issue for dataset in datasets for issue in dataset.get("issues", [])]
-    confirmed = [issue for issue in all_data_issues if issue.get("issue_nature") in {"Confirmed Invalid", "Rule Violation"} and issue.get("confidence") == "High"]
-    potential = [issue for issue in all_data_issues if issue.get("confidence") in {"Medium", "Low"}]
-    informational = [issue for issue in all_data_issues if issue.get("action") == "Informational"]
-    lines.extend([
-        "### 3.w Confirmed vs Potential Data Problems",
-        "",
-        f"- Confirmed: {len(confirmed)}",
-        f"- Potential / Needs Review: {len(potential)}",
-        f"- Informational: {len(informational)}",
-        "",
-    ])
-
     lines.extend([
         "## 4. AI Review",
+        "",
+        enhancement_summary(report),
+        "",
+        report_coverage_summary(report),
+        "",
+        render_finding_evidence([f for f in report.get("findings", []) if f["id"] not in report["ai_review"]]),
         "",
         report["ai_review"].strip(),
         "",
@@ -546,7 +545,7 @@ def build_markdown_report(report):
     if report["patch_text"]:
         lines.extend(["### Patch Information", "", "```diff", report["patch_text"].rstrip(), "```", ""])
     else:
-        lines.extend(["Patch：未生成（可能缺少可逐字引用的原始代码片段）。", ""])
+        lines.extend(["Patch：" + report["conclusions"]["patch_status"] + "；请参阅最终验证状态及说明。", ""])
 
     score = report["overall"].get("score", 0)
     caveat = report["overall"].get("caveat", "启发式静态评分。")
@@ -570,6 +569,7 @@ def _plain_markdown(text):
 
 def build_pdf_report(report):
     """Render a clean, in-memory PDF using ReportLab's CJK CID font."""
+    report = validate_report_consistency(report)
     try:
         from reportlab.lib import colors
         from reportlab.lib.enums import TA_CENTER, TA_LEFT
@@ -577,7 +577,7 @@ def build_pdf_report(report):
         from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
         from reportlab.lib.units import mm
         from reportlab.pdfbase import pdfmetrics
-        from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+        from reportlab.pdfbase.ttfonts import TTFont
         from reportlab.platypus import (
             KeepTogether, PageBreak, Paragraph, Preformatted, SimpleDocTemplate,
             Spacer, Table, TableStyle,
@@ -585,11 +585,14 @@ def build_pdf_report(report):
     except ImportError as exc:
         raise RuntimeError("PDF 报告依赖 reportlab，请安装 requirements.txt 后重试。") from exc
 
-    font_name = "STSong-Light"
+    font_name = "CodeData-NotoSansSC"
     try:
         pdfmetrics.getFont(font_name)
     except KeyError:
-        pdfmetrics.registerFont(UnicodeCIDFont(font_name))
+        font_path = Path(__file__).parent / "assets" / "fonts" / "NotoSansSC-Regular.ttf"
+        if not font_path.is_file():
+            raise RuntimeError("缺少项目附带的中文字体，请恢复 assets/fonts/NotoSansSC-Regular.ttf。")
+        pdfmetrics.registerFont(TTFont(font_name, str(font_path)))
 
     buffer = BytesIO()
     doc = SimpleDocTemplate(
@@ -605,7 +608,7 @@ def build_pdf_report(report):
     base = getSampleStyleSheet()
     body = ParagraphStyle(
         "CJKBody", parent=base["BodyText"], fontName=font_name, fontSize=9.2,
-        leading=14, textColor=colors.HexColor("#293241"), spaceAfter=5,
+        leading=14, textColor=colors.HexColor("#293241"), spaceAfter=5, wordWrap="CJK",
     )
     title_style = ParagraphStyle(
         "CJKTitle", parent=body, fontName="Helvetica-Bold", fontSize=22,
@@ -618,19 +621,18 @@ def build_pdf_report(report):
     )
     heading = ParagraphStyle(
         "Heading", parent=body, fontName="Helvetica-Bold", fontSize=14, leading=19,
-        textColor=colors.HexColor("#2563EB"), spaceBefore=12, spaceAfter=8,
+        textColor=colors.HexColor("#2563EB"), spaceBefore=12, spaceAfter=8, keepWithNext=True,
     )
     subheading = ParagraphStyle(
         "Subheading", parent=body, fontSize=11, leading=16,
-        textColor=colors.HexColor("#0F172A"), spaceBefore=8, spaceAfter=5,
+        textColor=colors.HexColor("#0F172A"), spaceBefore=8, spaceAfter=5, keepWithNext=True,
     )
     label = ParagraphStyle(
         "Label", parent=body, fontSize=8, leading=11, textColor=colors.HexColor("#64748B"),
     )
     code_style = ParagraphStyle(
-        # Courier does not contain CJK glyphs and rendered Chinese comments as
-        # black squares.  The CID fallback is Unicode-capable for both prose
-        # and code; no font binary is bundled with the project.
+        # Embed the bundled OFL font so Chinese remains readable even when
+        # neither the OS nor the PDF viewer has a Chinese font installed.
         "Code", parent=body, fontName=font_name, fontSize=7.4, leading=10,
         leftIndent=5, rightIndent=5, borderColor=colors.HexColor("#CBD5E1"),
         borderWidth=0.5, borderPadding=6, backColor=colors.HexColor("#F8FAFC"),
@@ -683,10 +685,14 @@ def build_pdf_report(report):
         ("TOPPADDING", (0, 0), (-1, -1), 6),
         ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
     ]))
-    story.extend([overview_table, Spacer(1, 5 * mm), section(2, "Code Quality Analysis")])
+    story.append(overview_table)
+    story.append(p("最终结论与问题清单", subheading))
+    story.extend(p(line) for line in conclusion_summary_lines(report))
+    story.extend(p(finding_summary_line(issue)) for issue in report["conclusions"]["finding_rows"])
+    story.extend([Spacer(1, 5 * mm), section(2, "Code Quality Analysis")])
     code = report["code_quality"]
     summary_table = Table([
-        [p("代码质量评分", label), p(f"{code['score']}/100"), p("问题数量", label), p(code["issue_count"])],
+        [p("代码质量评分", label), p(f"{code['score']}/100"), p("需处理条目", label), p(code["issue_count"])],
     ], colWidths=[31 * mm, 46 * mm, 31 * mm, 46 * mm])
     summary_table.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#F8FAFC")),
@@ -797,6 +803,7 @@ def build_pdf_report(report):
                     f"{issue.get('category', 'Code Quality')} · {issue['type']}",
                     subheading,
                 ),
+                p(f"问题编号：{issue['id']} / {issue['problem_id']}；验证状态：{issue['verification_label']}"),
                 p(f"位置：{location}"),
                 p(
                     f"Affected Files ({len(issue.get('affected_files', []))})："
@@ -915,9 +922,12 @@ def build_pdf_report(report):
         story.append(p("项目中没有可分析的 CSV 文件。"))
 
     story.extend([PageBreak(), section(4, "AI Review")])
+    for line in (enhancement_summary(report) + "\n\n" + report_coverage_summary(report)).split("\n\n"):
+        story.append(p(line, body))
+    finding_text = render_finding_evidence([f for f in report.get("findings", []) if f["id"] not in report["ai_review"]])
     in_code = False
     code_lines = []
-    for raw_line in report["ai_review"].splitlines():
+    for raw_line in (finding_text + "\n" + report["ai_review"]).splitlines():
         stripped = raw_line.strip()
         if stripped.startswith("```"):
             if in_code:
@@ -943,6 +953,7 @@ def build_pdf_report(report):
                 p(f"位置：{repair.get('location', 'Unknown')}"),
                 p(f"修改说明：{repair.get('explanation', repair.get('reason', ''))}"),
                 p(f"验证状态：{repair.get('validation_status', 'Not Automatically Verifiable')}"),
+                p(f"验证说明：{repair.get('validation_detail', '未执行自动验证。')}"),
                 p("Before", label),
                 (
                     Preformatted(repair.get("before_code"), code_style)

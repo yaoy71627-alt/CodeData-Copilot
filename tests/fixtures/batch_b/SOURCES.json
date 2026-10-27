@@ -1,0 +1,78 @@
+{
+  "retrieved_utc": "2026-10-19",
+  "execution": "Static analysis only; downloaded project code never executed",
+  "files": [
+    {
+      "path": "ibm/employee-attrition.ipynb",
+      "repository": "IBM/employee-attrition-aif360",
+      "commit": "13287d5f717dc978eda249aef4665e04c7cec8b0",
+      "source_path": "notebooks/employee-attrition.ipynb",
+      "url": "https://raw.githubusercontent.com/IBM/employee-attrition-aif360/13287d5f717dc978eda249aef4665e04c7cec8b0/notebooks/employee-attrition.ipynb",
+      "sha256": "0dfc627f37269fafd41a4ba4ecba3e25b5d66fca3f8f28a1fef1565b04f130b6"
+    },
+    {
+      "path": "ibm/emp_attrition.csv",
+      "repository": "IBM/employee-attrition-aif360",
+      "commit": "13287d5f717dc978eda249aef4665e04c7cec8b0",
+      "source_path": "data/emp_attrition.csv",
+      "url": "https://raw.githubusercontent.com/IBM/employee-attrition-aif360/13287d5f717dc978eda249aef4665e04c7cec8b0/data/emp_attrition.csv",
+      "sha256": "a5c31e38bd7fafc9bc333884eb181b06b41b8e5e488e8f7ccb27199fb3be7659"
+    },
+    {
+      "path": "ibm/LICENSE",
+      "repository": "IBM/employee-attrition-aif360",
+      "commit": "13287d5f717dc978eda249aef4665e04c7cec8b0",
+      "source_path": "LICENSE",
+      "url": "https://raw.githubusercontent.com/IBM/employee-attrition-aif360/13287d5f717dc978eda249aef4665e04c7cec8b0/LICENSE",
+      "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+    },
+    {
+      "path": "telco/src/analysis.py",
+      "repository": "adammorphy/Telco_Customer_Churn_Prediction_Group12",
+      "commit": "acb6710ddc334bc270e379c9a98bc560347bf142",
+      "source_path": "src/analysis.py",
+      "url": "https://raw.githubusercontent.com/adammorphy/Telco_Customer_Churn_Prediction_Group12/acb6710ddc334bc270e379c9a98bc560347bf142/src/analysis.py",
+      "sha256": "93522ef7e2855751b3d9177d12aae51343cd27059db5bdfa67518106ea5bd6fa"
+    },
+    {
+      "path": "telco/src/data_download.py",
+      "repository": "adammorphy/Telco_Customer_Churn_Prediction_Group12",
+      "commit": "acb6710ddc334bc270e379c9a98bc560347bf142",
+      "source_path": "src/data_download.py",
+      "url": "https://raw.githubusercontent.com/adammorphy/Telco_Customer_Churn_Prediction_Group12/acb6710ddc334bc270e379c9a98bc560347bf142/src/data_download.py",
+      "sha256": "315ecc51d043f82e01720246ea42d2da3e574402f1509c70f6cf78e3923667b6"
+    },
+    {
+      "path": "telco/src/pre_process_script.py",
+      "repository": "adammorphy/Telco_Customer_Churn_Prediction_Group12",
+      "commit": "acb6710ddc334bc270e379c9a98bc560347bf142",
+      "source_path": "src/pre_process_script.py",
+      "url": "https://raw.githubusercontent.com/adammorphy/Telco_Customer_Churn_Prediction_Group12/acb6710ddc334bc270e379c9a98bc560347bf142/src/pre_process_script.py",
+      "sha256": "b6637b64cf59414a5a96bb5cda93701ae95d86c8a8d2887bd0b2f1a485d97189"
+    },
+    {
+      "path": "telco/src/eda_script.py",
+      "repository": "adammorphy/Telco_Customer_Churn_Prediction_Group12",
+      "commit": "acb6710ddc334bc270e379c9a98bc560347bf142",
+      "source_path": "src/eda_script.py",
+      "url": "https://raw.githubusercontent.com/adammorphy/Telco_Customer_Churn_Prediction_Group12/acb6710ddc334bc270e379c9a98bc560347bf142/src/eda_script.py",
+      "sha256": "829e43fa4f8549e81a6e4fdffdfdc5643ac91801fb194c353567288c1511acf1"
+    },
+    {
+      "path": "telco/README.md",
+      "repository": "adammorphy/Telco_Customer_Churn_Prediction_Group12",
+      "commit": "acb6710ddc334bc270e379c9a98bc560347bf142",
+      "source_path": "README.md",
+      "url": "https://raw.githubusercontent.com/adammorphy/Telco_Customer_Churn_Prediction_Group12/acb6710ddc334bc270e379c9a98bc560347bf142/README.md",
+      "sha256": "b933cbc3946de342e8777b68b37ab3fb54a73e7ed6249bdfbaff278f8e3cfd65"
+    },
+    {
+      "path": "telco/LICENSE",
+      "repository": "adammorphy/Telco_Customer_Churn_Prediction_Group12",
+      "commit": "acb6710ddc334bc270e379c9a98bc560347bf142",
+      "source_path": "LICENSE",
+      "url": "https://raw.githubusercontent.com/adammorphy/Telco_Customer_Churn_Prediction_Group12/acb6710ddc334bc270e379c9a98bc560347bf142/LICENSE",
+      "sha256": "430fcca847ffb30b98f536bde3df22a5288a4b5bc1f3c659427356268818566c"
+    }
+  ]
+}

@@ -127,7 +127,8 @@ for n in [10, 50, 100]:
         self.assertIn("DQ_DISCRETE_DISTRIBUTION_REVIEW", rules)
         self.assertNotIn("DQ_POTENTIAL_EXTREME_VALUES", rules)
         issue = next(item for item in result["issues"] if item["rule_id"] == "DQ_DISCRETE_DISTRIBUTION_REVIEW")
-        self.assertEqual(issue["action"], "Review")
+        self.assertEqual(issue["action"], "Informational")
+        self.assertEqual(issue["score_impact"], 0)
 
     def test_08_continuous_salary_still_uses_outlier_detection(self):
         values = list(range(50_000, 50_030)) + [5_000_000]

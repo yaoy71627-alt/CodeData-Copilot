@@ -181,7 +181,8 @@ model_data = model_data.dropna()
         self.assertEqual(outlier["type"], "Potential Statistical Outlier")
         self.assertEqual(outlier["issue_nature"], "Statistical Anomaly")
         self.assertNotEqual(outlier["issue_nature"], "Confirmed Invalid")
-        self.assertEqual(outlier["action"], "Review")
+        self.assertEqual(outlier["action"], "Informational")
+        self.assertEqual(outlier["score_impact"], 0)
 
     def test_08_reproducible_split_detects_cross_split_duplicates(self):
         frame = pd.DataFrame({

@@ -1,0 +1,30 @@
+[
+  {
+    "path": "Makefile",
+    "sha256": "e7947158e0077db9a56a1a6d461c42dc47944d1d08665afa53406ba3566c4feb",
+    "repository": "adammorphy/Telco_Customer_Churn_Prediction_Group12",
+    "commit": "acb6710ddc334bc270e379c9a98bc560347bf142",
+    "source_path": "Makefile"
+  },
+  {
+    "path": "data/raw/IBM-Telco-Customer-Churn.csv",
+    "sha256": "a0ea74c48c1063be89a73ce3fb868593604c0129f2bf581934f04983d728b3b5",
+    "repository": "adammorphy/Telco_Customer_Churn_Prediction_Group12",
+    "commit": "acb6710ddc334bc270e379c9a98bc560347bf142",
+    "source_path": "data/raw/IBM-Telco-Customer-Churn.csv"
+  },
+  {
+    "path": "data/processed/train_df.csv",
+    "sha256": "34b46c0101305e7b99420408ccca9ff7d1e60da372107f8c753ee722984dfd7b",
+    "repository": "adammorphy/Telco_Customer_Churn_Prediction_Group12",
+    "commit": "acb6710ddc334bc270e379c9a98bc560347bf142",
+    "source_path": "data/processed/train_df.csv"
+  },
+  {
+    "path": "data/processed/test_df.csv",
+    "sha256": "4e428497fdfb4ff5814f3a294c0a3914bd46fca0179fb25c7fd1e56f3b3e0a9e",
+    "repository": "adammorphy/Telco_Customer_Churn_Prediction_Group12",
+    "commit": "acb6710ddc334bc270e379c9a98bc560347bf142",
+    "source_path": "data/processed/test_df.csv"
+  }
+]

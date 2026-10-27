@@ -1,6 +1,7 @@
 """P0 regressions for safe Titanic modeling-data reconstruction."""
 
 from pathlib import Path
+import os
 
 import numpy as np
 import pandas as pd
@@ -364,8 +365,10 @@ def test_real_titanic_expected_counts_when_case_data_is_available():
         "SibSp", "Parch", "Fare", "Embarked",
     }
     csv_path = None
-    for candidate in project_root.rglob("*.csv"):
-        if "titanic" not in candidate.name.casefold():
+    configured = os.environ.get("CODEDATA_TITANIC_CSV")
+    candidates = [Path(configured)] if configured else project_root.rglob("*.csv")
+    for candidate in candidates:
+        if not configured and "titanic" not in candidate.name.casefold():
             continue
         try:
             candidate_frame = pd.read_csv(candidate)
@@ -375,6 +378,8 @@ def test_real_titanic_expected_counts_when_case_data_is_available():
             csv_path = candidate
             break
     if csv_path is None:
+        if configured:
+            pytest.fail("CODEDATA_TITANIC_CSV is unreadable or does not match the original 916-row case schema")
         pytest.skip("The 916-row Titanic case CSV is not available in this project.")
 
     features = ["Pclass", "Sex", "Age", "SibSp", "Parch", "Fare", "Embarked"]

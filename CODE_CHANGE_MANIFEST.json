@@ -1,0 +1,486 @@
+{
+  "comparison": "本轮原始上传包与批次 D 最终包逐字节比较，A—D 累计变更；并非仅 C→D。",
+  "original_archive": "CodeData-Copilot-master (2).zip",
+  "original_archive_sha256": "f407935aebc2b95e400a77f6c8badc6a12ab644f64a27aaa8f164b9e1a98d698",
+  "final_archive": "CodeData-Copilot-Batch-D.zip",
+  "final_archive_sha256": "868c37181ec108e72b9223159a1a6b0e207289e41d5be9a81264738960c05f3d",
+  "modified_code_count": 12,
+  "added_code_count": 32,
+  "exported_code_count": 44,
+  "unchanged_code_not_exported": [
+    "data_analyzer.py",
+    "demo_data/test.ipynb",
+    "notebook_syntax.py",
+    "patch_generator.py",
+    "project_dedup.py",
+    "run_app.bat",
+    "style.css",
+    "tests/conftest",
+    "tests/test_app.py",
+    "tests/test_cardekho_p0.py",
+    "tests/test_case_regressions.py",
+    "tests/test_code_review_rules.py",
+    "tests/test_data_quality_rules.py",
+    "tests/test_final_report_consistency",
+    "tests/test_full_regression_acceptance",
+    "tests/test_knowledge_resilience",
+    "tests/test_new_reliability_round.py",
+    "tests/test_quality_integration.py",
+    "tests/test_reliability_gaps.py",
+    "tests/test_repair_reliability_p1",
+    "tests/test_review_accuracy",
+    "tests/test_review_coverage",
+    "tests/test_titanic_regression.py",
+    "tests/test_upgrade.py"
+  ],
+  "deleted_code_files": [],
+  "files": [
+    {
+      "file": "agent.py",
+      "status": "modified",
+      "category": "application_or_tool",
+      "original_sha256": "7887f535edfb4d991664c1a60801466160372a26d6f353067c1ac21bb76bf7ab",
+      "final_sha256": "b8dc3066912e6824a717a5489e34132b4e41c06030e87daa8e48508b96b8f161",
+      "bytes": 23674
+    },
+    {
+      "file": "app.py",
+      "status": "modified",
+      "category": "application_or_tool",
+      "original_sha256": "6deddd89dfa1a098c6d4928d626c20c10c730e720957842b46ac9b53b03fab73",
+      "final_sha256": "733c39b8ce705792cb264d4a02f0a01b628a60fa265ecc90a854d8809fafb2e6",
+      "bytes": 76586
+    },
+    {
+      "file": "code_analyzer.py",
+      "status": "modified",
+      "category": "application_or_tool",
+      "original_sha256": "6bd2d70fc62708311393a8eee821f9bd05e3738e97350e54c70f4275cfe073ab",
+      "final_sha256": "de599d524cd68e080a276b927d07ff1c6d6d19315f5a3cb66b09f875b8b9c986",
+      "bytes": 51170
+    },
+    {
+      "file": "consistency_validator.py",
+      "status": "modified",
+      "category": "application_or_tool",
+      "original_sha256": "1654d6aa2228ff1f03f9fd24e054bf9f301e56f6630a411c54d757ff797df63d",
+      "final_sha256": "5dee77879d4370a54d4c56ea286ed7f4e732452452cee965e45976640857f826",
+      "bytes": 46681
+    },
+    {
+      "file": "data_flow_analyzer.py",
+      "status": "modified",
+      "category": "application_or_tool",
+      "original_sha256": "a4e1aa908744a6e0b6c8b88ada28497a578dfd663e65a313d3e70a782cfb4de3",
+      "final_sha256": "09fa2de0994430b4d9e65cddb837e001a928fda0ba4f8183cc3fbeb90e1aeec1",
+      "bytes": 114398
+    },
+    {
+      "file": "file_loader.py",
+      "status": "modified",
+      "category": "application_or_tool",
+      "original_sha256": "e2f2b4eb329b1f959a5ba9d96ad0137db14bd84b55105f0c739f8658d430fcda",
+      "final_sha256": "746580c4d578abe9fae9420c90b006fa3e9b40451ad9948dade1538eeae17d81",
+      "bytes": 5332
+    },
+    {
+      "file": "github_loader.py",
+      "status": "modified",
+      "category": "application_or_tool",
+      "original_sha256": "0dcc27e1b9f257c14118ce3ae567481bce4242ea497ce9f70ceb28e31ba2dabe",
+      "final_sha256": "959e6cf1463e1152a2d5a75280b931e9f40a9e8b86c7cf60a5aa294515197788",
+      "bytes": 12796
+    },
+    {
+      "file": "project_archive.py",
+      "status": "added",
+      "category": "application_or_tool",
+      "original_sha256": null,
+      "final_sha256": "6d31968f09cb214976b72cb819307a2094ee9d2b74f6330ec3f95dcf5520907c",
+      "bytes": 6958
+    },
+    {
+      "file": "project_lineage.py",
+      "status": "added",
+      "category": "application_or_tool",
+      "original_sha256": null,
+      "final_sha256": "5580b1ce54ff3b7a02a7f00c988b152d0a75bcdcacb01c1fa1b3371ce00f5f5c",
+      "bytes": 17818
+    },
+    {
+      "file": "project_overview.py",
+      "status": "modified",
+      "category": "application_or_tool",
+      "original_sha256": "02c026edd1fb9d44d5488e33bc1e7e04380f31f41d1683f3509e3e98b8aba2b3",
+      "final_sha256": "ca51f595f2ca5e20f414c61e90637787a510671faef84f170e4745e9e7866cd3",
+      "bytes": 6277
+    },
+    {
+      "file": "project_score.py",
+      "status": "modified",
+      "category": "application_or_tool",
+      "original_sha256": "a84085ad9b69402b0f4c18da1b8c589942f48f34017cec8347c33d6b9bb3162c",
+      "final_sha256": "70d90c8d0649e8b657d4f516ac7bcfded0d703536193905a0d9b59b8eb8cd6f1",
+      "bytes": 6958
+    },
+    {
+      "file": "qwen_runtime.py",
+      "status": "added",
+      "category": "application_or_tool",
+      "original_sha256": null,
+      "final_sha256": "0fb5c76fe2897d406213da4555b4bcd95dd0951cf05dda06f6e8fd896e20e817",
+      "bytes": 15825
+    },
+    {
+      "file": "regression_benchmark.py",
+      "status": "added",
+      "category": "application_or_tool",
+      "original_sha256": null,
+      "final_sha256": "fe91127d294ca2054ddad23572e351056c6fb6936498bfdf97ced23c0ab8a175",
+      "bytes": 4412
+    },
+    {
+      "file": "repair_validator.py",
+      "status": "modified",
+      "category": "application_or_tool",
+      "original_sha256": "2c59ded69456f98f32097fd0de5c731db55ea192501845f299f88101fbf28aa5",
+      "final_sha256": "c4bcb9c66a886d13f5cfdcaa551a5fa9d7de85dac99f750aff7f75a4a05e1460",
+      "bytes": 38679
+    },
+    {
+      "file": "report.py",
+      "status": "modified",
+      "category": "application_or_tool",
+      "original_sha256": "213e774210f6522ba0ca954ac9890b5c2957d09a820155359bc5fffc01a0153b",
+      "final_sha256": "1b48ec58a60e40fc6ccc11af3334461699fb88c416f3fa10d399b5cec0575974",
+      "bytes": 52144
+    },
+    {
+      "file": "scripts/check_qwen_connection.py",
+      "status": "added",
+      "category": "application_or_tool",
+      "original_sha256": null,
+      "final_sha256": "8d61268251ef9fd3655f8cccb93de447a45391e06b0a61f0a1c9f7a419d45ae0",
+      "bytes": 1807
+    },
+    {
+      "file": "scripts/render_regression_pdfs.py",
+      "status": "added",
+      "category": "application_or_tool",
+      "original_sha256": null,
+      "final_sha256": "de4551dea558d3edad6a2a58ce0d14d2d6cd16c4971bf8547719b861d9c9116e",
+      "bytes": 2594
+    },
+    {
+      "file": "scripts/run_batch_d.py",
+      "status": "added",
+      "category": "application_or_tool",
+      "original_sha256": null,
+      "final_sha256": "becb47a40f5b4557b0f125713d13b9a417cedad2b7cd96f1bc99349905507c9c",
+      "bytes": 5725
+    },
+    {
+      "file": "static_review_rules.py",
+      "status": "added",
+      "category": "application_or_tool",
+      "original_sha256": null,
+      "final_sha256": "39ce7a68e297fd503999b90a2e7c02afd72dcb07e313c825d58ac2840778751a",
+      "bytes": 30061
+    },
+    {
+      "file": "tests/conftest.py",
+      "status": "added",
+      "category": "test_code",
+      "original_sha256": null,
+      "final_sha256": "670feedd0b4fa934dd45af159859c57e0b6153c3a8e572eef353c7738aefc379",
+      "bytes": 3413
+    },
+    {
+      "file": "tests/fixtures/batch_b/ibm/employee-attrition.ipynb",
+      "status": "added",
+      "category": "reference_fixture",
+      "original_sha256": null,
+      "final_sha256": "0dfc627f37269fafd41a4ba4ecba3e25b5d66fca3f8f28a1fef1565b04f130b6",
+      "bytes": 52521
+    },
+    {
+      "file": "tests/fixtures/batch_b/telco/src/analysis.py",
+      "status": "added",
+      "category": "reference_fixture",
+      "original_sha256": null,
+      "final_sha256": "93522ef7e2855751b3d9177d12aae51343cd27059db5bdfa67518106ea5bd6fa",
+      "bytes": 7348
+    },
+    {
+      "file": "tests/fixtures/batch_b/telco/src/data_download.py",
+      "status": "added",
+      "category": "reference_fixture",
+      "original_sha256": null,
+      "final_sha256": "315ecc51d043f82e01720246ea42d2da3e574402f1509c70f6cf78e3923667b6",
+      "bytes": 2095
+    },
+    {
+      "file": "tests/fixtures/batch_b/telco/src/eda_script.py",
+      "status": "added",
+      "category": "reference_fixture",
+      "original_sha256": null,
+      "final_sha256": "829e43fa4f8549e81a6e4fdffdfdc5643ac91801fb194c353567288c1511acf1",
+      "bytes": 6755
+    },
+    {
+      "file": "tests/fixtures/batch_b/telco/src/pre_process_script.py",
+      "status": "added",
+      "category": "reference_fixture",
+      "original_sha256": null,
+      "final_sha256": "b6637b64cf59414a5a96bb5cda93701ae95d86c8a8d2887bd0b2f1a485d97189",
+      "bytes": 3315
+    },
+    {
+      "file": "tests/fixtures/batch_c/telco/Makefile",
+      "status": "added",
+      "category": "reference_fixture",
+      "original_sha256": null,
+      "final_sha256": "e7947158e0077db9a56a1a6d461c42dc47944d1d08665afa53406ba3566c4feb",
+      "bytes": 2164
+    },
+    {
+      "file": "tests/test_batch_b_cases.py",
+      "status": "added",
+      "category": "test_code",
+      "original_sha256": null,
+      "final_sha256": "10f3d4328f4cc3462b007d528d0a937ab7e1953a3ef73e53bb53e54d6e3790eb",
+      "bytes": 6406
+    },
+    {
+      "file": "tests/test_batch_b_rules.py",
+      "status": "added",
+      "category": "test_code",
+      "original_sha256": null,
+      "final_sha256": "1f0f3acfc7278464fc02cc7c963d29c59e2ec914ded843b18fcc4a5ee50d3302",
+      "bytes": 11013
+    },
+    {
+      "file": "tests/test_batch_c_archives.py",
+      "status": "added",
+      "category": "test_code",
+      "original_sha256": null,
+      "final_sha256": "2ad9a751b22ff27c303d96f6f0ae2f0d029cf12463e5ce596be1194765370dd4",
+      "bytes": 5486
+    },
+    {
+      "file": "tests/test_batch_c_integration.py",
+      "status": "added",
+      "category": "test_code",
+      "original_sha256": null,
+      "final_sha256": "9c48c2153a01108d77c3ad534052529b70b05b852e395a6adb1ca9b5f4a8f49c",
+      "bytes": 7703
+    },
+    {
+      "file": "tests/test_batch_c_lineage.py",
+      "status": "added",
+      "category": "test_code",
+      "original_sha256": null,
+      "final_sha256": "1fe7dd3703f2d5f8d7bbfbfd309ca74d6a7cf3beef96883c9e951e888d2c1090",
+      "bytes": 9417
+    },
+    {
+      "file": "tests/test_batch_d_acceptance.py",
+      "status": "added",
+      "category": "test_code",
+      "original_sha256": null,
+      "final_sha256": "c450835715a54533940e8bb20b1a210b9829891cdb914ca8d7b6406e7218a905",
+      "bytes": 9794
+    },
+    {
+      "file": "tests/test_batch_d_runner.py",
+      "status": "added",
+      "category": "test_code",
+      "original_sha256": null,
+      "final_sha256": "5264490bb016c2b03a6ebb5b454b5ae9c4e3d1caf4d72d4f1ee5b4b7cc816aa5",
+      "bytes": 1976
+    },
+    {
+      "file": "tests/test_final_report_consistency.py",
+      "status": "added",
+      "category": "test_code",
+      "original_sha256": null,
+      "final_sha256": "d834bc38f4eda61f54d6e7a14c8fc1b4dcf37ebe807961afe1ea9013afe27a7e",
+      "bytes": 13957
+    },
+    {
+      "file": "tests/test_full_regression_acceptance.py",
+      "status": "added",
+      "category": "test_code",
+      "original_sha256": null,
+      "final_sha256": "67a6139fde776a0e0b013b6c891e64f73ea1a7b2e4c39c178ce0c7886fc6eda2",
+      "bytes": 21426
+    },
+    {
+      "file": "tests/test_knowledge_resilience.py",
+      "status": "added",
+      "category": "test_code",
+      "original_sha256": null,
+      "final_sha256": "40d6813b8bb75c2e1e5254ef1e6e001a297daa82933931373a4d056466a70fff",
+      "bytes": 9912
+    },
+    {
+      "file": "tests/test_pdf_smoke.py",
+      "status": "added",
+      "category": "test_code",
+      "original_sha256": null,
+      "final_sha256": "25f315931148b9ca05559facc8f41fa9facb353541c676646e6bbabd2b6bd7e1",
+      "bytes": 8711
+    },
+    {
+      "file": "tests/test_qwen_batch_a.py",
+      "status": "added",
+      "category": "test_code",
+      "original_sha256": null,
+      "final_sha256": "c16412a3814267471af20edaa18dac282ef69d44abe84e33594a849a0001d99e",
+      "bytes": 13577
+    },
+    {
+      "file": "tests/test_qwen_online.py",
+      "status": "added",
+      "category": "test_code",
+      "original_sha256": null,
+      "final_sha256": "a94b83cd8b552404002f16b12f8c5e0818095a40a838cab65005f7f5829e3718",
+      "bytes": 1397
+    },
+    {
+      "file": "tests/test_regression_benchmark.py",
+      "status": "added",
+      "category": "test_code",
+      "original_sha256": null,
+      "final_sha256": "49a8c0e28782a9597d8498cd520198309263385b22c1b38a6763947df586fb44",
+      "bytes": 2656
+    },
+    {
+      "file": "tests/test_repair_reliability_p1.py",
+      "status": "added",
+      "category": "test_code",
+      "original_sha256": null,
+      "final_sha256": "9cd11a8681a4e8bd8f337cc295cbce7d9f3f5e1cc1ba03c6019ac4d313b5de27",
+      "bytes": 15102
+    },
+    {
+      "file": "tests/test_review_accuracy.py",
+      "status": "added",
+      "category": "test_code",
+      "original_sha256": null,
+      "final_sha256": "e4dd7e5772beb16f2610514f7e318128c73214e64fe104fc0bd41cef8c85bd36",
+      "bytes": 13217
+    },
+    {
+      "file": "tests/test_review_coverage.py",
+      "status": "added",
+      "category": "test_code",
+      "original_sha256": null,
+      "final_sha256": "d483109806c8d4efb7a01ee0134080a87fcbd77483407638822f563f383926fd",
+      "bytes": 11477
+    },
+    {
+      "file": "tests/test_titanic_flow_p0.py",
+      "status": "modified",
+      "category": "test_code",
+      "original_sha256": "258a4fa1581f8f0acf6d6b23867a6004a39787c39516a909cef77e2b55c22f21",
+      "final_sha256": "0b93f453554bf9828ce40c145e563b60b0dd551a02b8db54b8b4a94ed40d269b",
+      "bytes": 15297
+    }
+  ],
+  "other_changed_files_not_exported": [
+    {
+      "file": "BATCH_A.md",
+      "status": "added"
+    },
+    {
+      "file": "BATCH_B.md",
+      "status": "added"
+    },
+    {
+      "file": "BATCH_C.md",
+      "status": "added"
+    },
+    {
+      "file": "BATCH_D.md",
+      "status": "added"
+    },
+    {
+      "file": "README.md",
+      "status": "modified"
+    },
+    {
+      "file": "assets/fonts/FONT_SOURCE.txt",
+      "status": "added"
+    },
+    {
+      "file": "assets/fonts/NotoSansSC-Regular.ttf",
+      "status": "added"
+    },
+    {
+      "file": "assets/fonts/OFL.txt",
+      "status": "added"
+    },
+    {
+      "file": "pytest.ini",
+      "status": "added"
+    },
+    {
+      "file": "requirements.txt",
+      "status": "modified"
+    },
+    {
+      "file": "tests/README.md",
+      "status": "added"
+    },
+    {
+      "file": "tests/fixtures/batch_b/SOURCES.json",
+      "status": "added"
+    },
+    {
+      "file": "tests/fixtures/batch_b/ibm/LICENSE",
+      "status": "added"
+    },
+    {
+      "file": "tests/fixtures/batch_b/ibm/emp_attrition.csv",
+      "status": "added"
+    },
+    {
+      "file": "tests/fixtures/batch_b/telco/LICENSE",
+      "status": "added"
+    },
+    {
+      "file": "tests/fixtures/batch_b/telco/README.md",
+      "status": "added"
+    },
+    {
+      "file": "tests/fixtures/batch_c/telco/LICENSE",
+      "status": "added"
+    },
+    {
+      "file": "tests/fixtures/batch_c/telco/SOURCES.json",
+      "status": "added"
+    },
+    {
+      "file": "tests/fixtures/batch_c/telco/data/processed/test_df.csv",
+      "status": "added"
+    },
+    {
+      "file": "tests/fixtures/batch_c/telco/data/processed/train_df.csv",
+      "status": "added"
+    },
+    {
+      "file": "tests/fixtures/batch_c/telco/data/raw/IBM-Telco-Customer-Churn.csv",
+      "status": "added"
+    },
+    {
+      "file": "tests/fixtures/batch_d/truth.json",
+      "status": "added"
+    },
+    {
+      "file": "tests/requirements.txt",
+      "status": "added"
+    }
+  ],
+  "security": "未打开任何 .env* 或 .git 成员；未导出这些成员、缓存、旧报告和验证产物。"
+}

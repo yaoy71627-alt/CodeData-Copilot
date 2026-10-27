@@ -135,7 +135,8 @@ def build_project_overview(file_names, sources, data_results, metadata=None):
         f"静态代码显示项目主要使用 {library_text}，涉及{'、'.join(structure)}。"
     )
     if data_files:
-        summary += f" 数据分析覆盖 {sum(item['rows'] for item in data_files)} 行记录。"
+        summary += (f" 数据文件含 {data_files[0]['rows']} 行记录。" if len(data_files) == 1 else
+                    " 各 CSV 的行数分别统计；原始与派生文件可能重叠，不相加作为独立样本总数。")
 
     return {
         "project_name": name,

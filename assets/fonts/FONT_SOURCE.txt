@@ -1,0 +1,7 @@
+Noto Sans SC, distributed under the SIL Open Font License 1.1 (see OFL.txt).
+Official source: https://github.com/google/fonts/tree/main/ofl/notosanssc
+Source font: NotoSansSC[wght].ttf
+Bundled file: NotoSansSC-Regular.ttf, a static wght=400 instance created with
+fontTools.varLib.instancer. No character-range subsetting was performed.
+Only this static font and the license are required at runtime. FontTools is
+not a new runtime dependency. ReportLab embeds used glyphs in each PDF.

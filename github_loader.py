@@ -13,14 +13,17 @@ from urllib.parse import urlsplit
 import zipfile
 
 
+from static_review_rules import is_dependency_manifest
+from project_archive import ArchiveBudget, inspect_zip, private_path, supported_path
+
 SUPPORTED_SUFFIXES = {".py", ".ipynb", ".csv", ".md"}
 MAX_FILE_SIZE = 100 * 1024 * 1024
 MAX_PROJECT_FILES = 100
 MAX_ARCHIVE_SIZE = 25 * 1024 * 1024
 MAX_ARCHIVE_MEMBERS = 500
 MAX_ARCHIVE_SOURCE_FILES = 50
-MAX_ARCHIVE_MEMBER_SIZE = 2 * 1024 * 1024
-MAX_ARCHIVE_UNCOMPRESSED_SIZE = 25 * 1024 * 1024
+MAX_ARCHIVE_MEMBER_SIZE = 25 * 1024 * 1024
+MAX_ARCHIVE_UNCOMPRESSED_SIZE = 100 * 1024 * 1024
 MAX_ARCHIVE_COMPRESSION_RATIO = 100
 MAX_ARCHIVE_DEPTH = 2
 CLONE_TIMEOUT_SECONDS = 300
@@ -143,113 +146,25 @@ def _safe_archive_member(name):
     )
 
 
-def _scan_zip_archive(
-    archive_path, logical_name, extraction_root, files, skipped, *, depth=1, payload=None,
-):
-    """Read source-only ZIP members under strict count, size and path limits."""
-    if depth > MAX_ARCHIVE_DEPTH:
-        skipped.append({
-            "path": logical_name, "reason": f"nested ZIP depth exceeds {MAX_ARCHIVE_DEPTH}",
-            "size_mb": None,
-        })
-        return
-    try:
-        size = len(payload) if payload is not None else archive_path.stat().st_size
-        if size > MAX_ARCHIVE_SIZE:
-            skipped.append({
-                "path": logical_name,
-                "reason": f"ZIP exceeds {MAX_ARCHIVE_SIZE // (1024 * 1024)} MB inspection limit",
-                "size_mb": round(size / (1024 * 1024), 2),
-            })
-            return
-        source = io.BytesIO(payload) if payload is not None else archive_path
-        with zipfile.ZipFile(source) as archive:
-            members = archive.infolist()
-            if len(members) > MAX_ARCHIVE_MEMBERS:
-                skipped.append({
-                    "path": logical_name,
-                    "reason": f"ZIP has {len(members)} members; limit is {MAX_ARCHIVE_MEMBERS}",
-                    "size_mb": round(size / (1024 * 1024), 2),
-                })
-                return
-            total = 0
-            extracted = 0
-            for info in members:
-                member_name = info.filename
-                if info.is_dir():
-                    continue
-                if not _safe_archive_member(member_name):
-                    skipped.append({
-                        "path": f"{logical_name}!/{member_name}",
-                        "reason": "unsafe archive member path", "size_mb": None,
-                    })
-                    continue
-                mode = (info.external_attr >> 16) & 0xFFFF
-                if mode and stat.S_ISLNK(mode):
-                    skipped.append({
-                        "path": f"{logical_name}!/{member_name}",
-                        "reason": "archive symlink not inspected", "size_mb": None,
-                    })
-                    continue
-                total += info.file_size
-                ratio = info.file_size / max(1, info.compress_size)
-                if total > MAX_ARCHIVE_UNCOMPRESSED_SIZE:
-                    skipped.append({
-                        "path": logical_name,
-                        "reason": "ZIP uncompressed-size budget exceeded", "size_mb": None,
-                    })
-                    break
-                if info.file_size > MAX_ARCHIVE_MEMBER_SIZE or ratio > MAX_ARCHIVE_COMPRESSION_RATIO:
-                    skipped.append({
-                        "path": f"{logical_name}!/{member_name}",
-                        "reason": "archive member size/compression ratio exceeds safety limit",
-                        "size_mb": round(info.file_size / (1024 * 1024), 2),
-                    })
-                    continue
-                suffix = PurePosixPath(member_name).suffix.casefold()
-                if suffix == ".zip":
-                    nested_payload = archive.read(info)
-                    _scan_zip_archive(
-                        archive_path, f"{logical_name}!/{member_name}", extraction_root,
-                        files, skipped, depth=depth + 1, payload=nested_payload,
-                    )
-                    continue
-                if suffix not in {".py", ".ipynb", ".md"}:
-                    continue
-                if extracted >= MAX_ARCHIVE_SOURCE_FILES or len(files) >= MAX_PROJECT_FILES:
-                    skipped.append({
-                        "path": f"{logical_name}!/{member_name}",
-                        "reason": "archive/project source-file limit reached", "size_mb": None,
-                    })
-                    continue
-                data = archive.read(info)
-                if b"\x00" in data[:8192]:
-                    skipped.append({
-                        "path": f"{logical_name}!/{member_name}",
-                        "reason": "binary content in source-looking member", "size_mb": None,
-                    })
-                    continue
-                destination = extraction_root / f"archive_{len(files):04d}" / Path(*PurePosixPath(member_name).parts)
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                destination.write_bytes(data)
-                files.append((f"{logical_name}!/{member_name}", destination))
-                extracted += 1
-            if extracted == 0:
-                skipped.append({
-                    "path": logical_name,
-                    "reason": "ZIP inspected safely; no supported source member was found",
-                    "size_mb": round(size / (1024 * 1024), 2),
-                })
-    except (OSError, zipfile.BadZipFile, RuntimeError) as exc:
-        skipped.append({
-            "path": logical_name, "reason": f"ZIP could not be safely inspected: {exc}",
-            "size_mb": None,
-        })
+def _archive_budget():
+    return ArchiveBudget(max_members=MAX_ARCHIVE_MEMBERS, max_files=MAX_PROJECT_FILES,
+                         max_member_bytes=MAX_ARCHIVE_MEMBER_SIZE,
+                         max_total_bytes=MAX_ARCHIVE_UNCOMPRESSED_SIZE,
+                         max_archive_bytes=MAX_ARCHIVE_SIZE,
+                         max_ratio=MAX_ARCHIVE_COMPRESSION_RATIO, max_depth=MAX_ARCHIVE_DEPTH)
+
+
+def _scan_zip_archive(archive_path, logical_name, extraction_root, files, skipped,
+                      *, depth=1, payload=None, budget=None):
+    """Use the same bounded CSV/source inspection as local ZIP imports."""
+    inspect_zip(payload if payload is not None else archive_path, logical_name,
+                extraction_root, files, skipped, budget or _archive_budget(), depth=depth)
 
 
 def _scan_repository(root):
     files = []
     skipped = []
+    archive_budget = _archive_budget()
     extraction_root = root.parent / "nested_sources"
     supported_text = "、".join(sorted(SUPPORTED_SUFFIXES))
 
@@ -270,6 +185,9 @@ def _scan_repository(root):
         for file_name in sorted(file_names):
             path = current_path / file_name
             relative = path.relative_to(root).as_posix()
+            if private_path(relative):
+                skipped.append({"path": relative, "reason": "敏感配置或忽略目录，未读取内容", "size_mb": None})
+                continue
             if path.is_symlink():
                 skipped.append({"path": relative, "reason": "符号链接文件未分析", "size_mb": None})
                 continue
@@ -281,9 +199,9 @@ def _scan_repository(root):
             size_mb = round(size / (1024 * 1024), 2)
             suffix = path.suffix.lower()
             if suffix == ".zip":
-                _scan_zip_archive(path, relative, extraction_root, files, skipped)
+                _scan_zip_archive(path, relative, extraction_root, files, skipped, budget=archive_budget)
                 continue
-            if suffix not in SUPPORTED_SUFFIXES:
+            if not supported_path(relative):
                 reason = ("二进制文件，不参与分析" if suffix in BINARY_SUFFIXES
                           else f"不支持的文件类型（仅分析 {supported_text}）")
                 skipped.append({"path": relative, "reason": reason, "size_mb": size_mb})
@@ -294,6 +212,9 @@ def _scan_repository(root):
                     "reason": f"文件超过 {MAX_FILE_SIZE // (1024 * 1024)} MB 上限",
                     "size_mb": size_mb,
                 })
+                continue
+            if archive_budget.bytes_read + size > archive_budget.max_total_bytes:
+                skipped.append({"path": relative, "reason": "项目总字节数超过共享预算", "size_mb": size_mb})
                 continue
             if _looks_binary(path):
                 skipped.append({"path": relative, "reason": "检测到二进制内容", "size_mb": size_mb})
@@ -306,6 +227,7 @@ def _scan_repository(root):
                 })
                 continue
             files.append((relative, path))
+            archive_budget.bytes_read += size
 
     return GitHubProjectFiles(files, skipped)
 

@@ -232,6 +232,29 @@ def _model_column_status(column, data_flow):
     return "Unknown"
 
 
+def _correlation_review_context(left, right, data_flow):
+    """Only promote correlation to a risk when the active model makes it relevant."""
+    flow = data_flow or {}
+    statuses = {_model_column_status(left, flow), _model_column_status(right, flow)}
+    model_types = sorted({str(item.get("type", "")) for item in flow.get("models", []) if item.get("type")})
+    correlation_sensitive = any(
+        re.search(r"(?:linear|logistic|ridge|lasso|elastic|svm|svc|svr)", name, re.I)
+        for name in model_types
+    )
+    both_in_model = statuses == {"Included"}
+    return {
+        "action": "Review" if both_in_model and correlation_sensitive else "Informational",
+        "score_impact": None if both_in_model and correlation_sensitive else 0,
+        "model_input_status": "Included" if both_in_model else "Excluded" if "Excluded" in statuses else "Unknown",
+        "model_types": model_types,
+        "reason": (
+            "两个字段均进入了对共线性敏感的模型。"
+            if both_in_model and correlation_sensitive else
+            "未证明两个字段同时进入对共线性敏感的模型；该结果仅作为统计观察。"
+        ),
+    }
+
+
 def _numeric_statistics(series):
     numeric = pd.to_numeric(series, errors="coerce")
     finite = numeric[numeric.map(lambda value: pd.notna(value) and math.isfinite(float(value)))]
@@ -464,15 +487,24 @@ def _detect_string_and_type_quality(df, issues, profiles, data_flow=None):
                 "确认该字段是否提供建模信息；不要在未确认用途前自动删除。",
                 column=column, evidence=f"唯一值：{_clean_scalar(counts.index[0])}",
                 count=int(non_null.count()), rate=1.0, sample_values=_samples(counts.index),
+                deduplication_key=f"constant-column:{column}",
             ))
         if row_count >= VERY_SMALL_ROW_THRESHOLD and unique_ratio >= HIGH_CARDINALITY_THRESHOLD:
+            model_status = _model_column_status(column, data_flow)
+            identifier_key = f"identifier-profile:{column}" if identifier_name else None
             issues.append(_issue(
                 "DQ_HIGH_CARDINALITY", "Categorical Quality", "High Cardinality",
                 "Low", "Medium",
                 f"字段 {column} 的唯一值比例较高。",
-                "确认该字段是标识符、自由文本还是可泛化的类别特征。",
+                ("该字段未进入已重建的当前模型输入；保留标识符统计即可。"
+                 if model_status == "Excluded" else
+                 "确认该字段是标识符、自由文本还是可泛化的类别特征；只有确认进入模型时才评估泛化风险。"),
                 column=column, evidence=f"{unique_count}/{row_count} 个唯一值（{unique_ratio:.2%}）。",
                 count=unique_count, rate=unique_ratio, sample_values=_samples(stripped),
+                model_input_status=model_status,
+                action="Informational" if model_status == "Excluded" or identifier_name else "Review",
+                score_impact=0 if model_status == "Excluded" or identifier_name else None,
+                deduplication_key=identifier_key,
             ))
         normalized_name = str(column).strip().casefold()
         name_suggests_id = bool(IDENTIFIER_NAME_RE.search(
@@ -481,13 +513,20 @@ def _detect_string_and_type_quality(df, issues, profiles, data_flow=None):
         if row_count >= VERY_SMALL_ROW_THRESHOLD and unique_ratio >= POTENTIAL_ID_THRESHOLD and (
             not pd.api.types.is_numeric_dtype(series) or name_suggests_id
         ):
+            model_status = _model_column_status(column, data_flow)
             issues.append(_issue(
                 "DQ_POTENTIAL_ID", "Feature Quality", "Potential ID-like Feature",
                 "Low", "Medium",
                 f"字段 {column} 几乎每行唯一，可能是标识符而非可泛化特征。",
-                "人工确认字段语义，并避免无意将记录标识符直接用于模型。",
+                ("该字段未进入已重建的当前模型输入；其唯一性是正常标识符特征。"
+                 if model_status == "Excluded" else
+                 "人工确认字段语义；只有确认进入模型时，才进一步审查标识符泛化风险。"),
                 column=column, evidence=f"唯一值比例 {unique_ratio:.2%}。",
                 count=unique_count, rate=unique_ratio, sample_values=_samples(stripped),
+                model_input_status=model_status,
+                action="Review" if model_status == "Included" else "Informational",
+                score_impact=None if model_status == "Included" else 0,
+                deduplication_key=f"identifier-profile:{column}",
             ))
         if row_count >= MIN_RARE_CATEGORY_ROWS and 1 < unique_count <= 100:
             rare = counts[counts / row_count < RARE_CATEGORY_THRESHOLD]
@@ -991,13 +1030,19 @@ def analyze_csv(csv_path, constraints=None, business_rules=None, data_flow=None)
     result["missing_values"] = missing[missing > 0].to_dict()
     for column, rate in result["missing_values"].items():
         count = int(df[column].isna().sum())
+        model_status = _model_column_status(column, data_flow)
+        excluded = model_status == "Excluded"
         issues.append(_issue(
             "DQ_MISSING_VALUES", "Missing Values", "Missing Values",
-            _severity_for_rate(float(rate), medium=0.10, high=0.50), "High",
+            "Low" if excluded else _severity_for_rate(float(rate), medium=0.10, high=0.50), "High",
             f"字段 {column} 存在真实缺失值。",
-            "结合缺失机制、目标变量与数据生成过程选择填补、建模或保留策略。",
+            ("该字段未进入已重建的当前模型输入；保留缺失统计，并按数据维护需要处理。"
+             if excluded else "结合缺失机制、目标变量与数据生成过程选择填补、建模或保留策略。"),
             column=column, evidence=f"{count}/{rows} 个值为 NaN/None（{rate:.2%}）。",
             count=count, rate=rate,
+            model_input_status=model_status,
+            action="Informational" if excluded else "Review",
+            score_impact=0 if excluded else None,
         ))
 
     for column in df.columns:
@@ -1020,6 +1065,7 @@ def analyze_csv(csv_path, constraints=None, business_rules=None, data_flow=None)
                     "确认字段是否仍具业务或审计用途；不要在未确认前自动删除。",
                     column=column, evidence=f"唯一有效值：{_clean_scalar(non_null.iloc[0])}",
                     count=int(non_null.count()), rate=1.0, sample_values=_samples(non_null),
+                    deduplication_key=f"constant-column:{column}",
                 ))
             elif not value_counts.empty:
                 dominant_rate = float(value_counts.iloc[0] / len(non_null))
@@ -1180,7 +1226,12 @@ def analyze_csv(csv_path, constraints=None, business_rules=None, data_flow=None)
         variable_profile = _numeric_variable_profile(column, finite)
         result["numeric_variable_types"][column] = variable_profile
         distribution_only = variable_profile["type"] != "continuous numeric"
+        explicit_domain = constraints.get(column, {}).get(
+            "allowed_values", constraints.get(column, {}).get("categories")
+        )
         if (
+            explicit_domain is None
+            and
             len(finite) >= 50
             and variable_profile.get("integer_like")
             and 4 <= variable_profile.get("unique_count", 0) <= 20
@@ -1222,7 +1273,8 @@ def analyze_csv(csv_path, constraints=None, business_rules=None, data_flow=None)
                         sample_values=_samples(series[outside_mask]),
                         affected_rows=rows_affected,
                         issue_origin="Dominant categorical domain heuristic",
-                        issue_nature="Potential Business Rule", action="Review",
+                        issue_nature="Distribution Review", action="Informational",
+                        score_impact=0,
                         dominant_domain=[_clean_scalar(value) for value in dominant.index.tolist()],
                     ))
         skewness = stats.get("skewness")
@@ -1269,7 +1321,8 @@ def analyze_csv(csv_path, constraints=None, business_rules=None, data_flow=None)
                         count=count, rate=rate, sample_values=_samples(series[outlier_mask]),
                         affected_rows=[int(index) for index in series[outlier_mask].index[:20]],
                         issue_origin=f"Type-aware review after {method}",
-                        issue_nature="Distribution Review", action="Review",
+                        issue_nature="Distribution Review", action="Informational",
+                        score_impact=0,
                         method=method, variable_type=variable_profile["type"],
                         lower_bound=_clean_scalar(lower), upper_bound=_clean_scalar(upper),
                     ))
@@ -1285,7 +1338,8 @@ def analyze_csv(csv_path, constraints=None, business_rules=None, data_flow=None)
                         count=count, rate=rate, sample_values=_samples(series[outlier_mask]),
                         affected_rows=[int(index) for index in series[outlier_mask].index[:20]],
                         issue_origin=f"Statistical method: {method}",
-                        issue_nature="Statistical Anomaly", action="Review",
+                        issue_nature="Statistical Anomaly", action="Informational",
+                        score_impact=0,
                         method=method, variable_type=variable_profile["type"],
                         lower_bound=_clean_scalar(lower), upper_bound=_clean_scalar(upper),
                         minimum=_clean_scalar(finite.min()), maximum=_clean_scalar(finite.max()),
@@ -1350,13 +1404,18 @@ def analyze_csv(csv_path, constraints=None, business_rules=None, data_flow=None)
             value = correlation.loc[left, right]
             if pd.notna(value) and abs(float(value)) >= HIGH_CORRELATION_THRESHOLD:
                 pair = {"feature_a": left, "feature_b": right, "correlation": round(float(value), 6)}
+                context = _correlation_review_context(left, right, data_flow)
                 result["high_correlation_pairs"].append(pair)
                 issues.append(_issue(
                     "DQ_HIGH_CORRELATION", "Correlation", "Highly Correlated Features",
                     "Low", "High", f"字段 {left} 与 {right} 高度相关，可能包含冗余信息。",
                     "结合业务语义、模型类型和稳定性评估是否保留两者；不要自动删除。",
-                    column=f"{left} / {right}", evidence=f"Pearson r={float(value):.4f}",
-                    rate=abs(float(value)), **pair,
+                    column=f"{left} / {right}",
+                    evidence=f"Pearson r={float(value):.4f}；{context['reason']}",
+                    rate=abs(float(value)), action=context["action"],
+                    score_impact=context["score_impact"],
+                    model_input_status=context["model_input_status"],
+                    model_types=context["model_types"], **pair,
                 ))
 
     for column in df.columns:

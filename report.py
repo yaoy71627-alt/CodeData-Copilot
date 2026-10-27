@@ -1,6 +1,7 @@
 """Canonical analysis report data plus Markdown and PDF renderers."""
 
 from __future__ import annotations
+from ui_review_helpers import display_text, ai_outcome
 
 from datetime import datetime, timezone
 from copy import deepcopy
@@ -11,6 +12,35 @@ from xml.sax.saxutils import escape
 
 from data_flow_analyzer import flow_summary_text
 from consistency_validator import (build_findings, render_finding_evidence, coverage_for_review, coverage_summary, ensure_review_coverage, legacy_data_issues, validate_report_consistency, conclusion_summary_lines, finding_summary_line, ReviewText)
+
+
+def _result_layer_counts(issues):
+    """Use the same actionable/informational split in every report format."""
+    items = list(issues or [])
+    actionable = sum(
+        issue.get("score_impact") != 0 and issue.get("action") != "Informational"
+        for issue in items
+    )
+    return actionable, len(items) - actionable
+
+
+def _unique_split_risks(risks):
+    """Defensively suppress identical legacy summaries at render time."""
+    unique = []
+    seen = set()
+    for risk in risks or []:
+        evidence = tuple(
+            (
+                item.get("file"), item.get("cell"), item.get("line"),
+                item.get("purpose"), item.get("target"), item.get("prediction"),
+            )
+            for item in risk.get("evidence", []) if isinstance(item, dict)
+        )
+        key = (risk.get("rule_id"), risk.get("type"), evidence)
+        if key not in seen:
+            unique.append(risk)
+            seen.add(key)
+    return unique
 
 
 def count_code_issues(code_result):
@@ -44,7 +74,10 @@ def build_data_issues(data_result):
 def summarize_results(code_result, data_result):
     return {
         "code_issue_count": count_code_issues(code_result),
-        "data_issue_count": len(build_data_issues(data_result)),
+        "data_issue_count": sum(
+            issue.get("score_impact") != 0 and issue.get("action") != "Informational"
+            for issue in build_data_issues(data_result)
+        ),
         "rows": data_result.get("shape", {}).get("rows", 0) if data_result else 0,
         "columns": data_result.get("shape", {}).get("columns", 0) if data_result else 0,
     }
@@ -66,6 +99,8 @@ def _data_quality_score(result):
     weights = {"High": 18, "Medium": 7, "Low": 2}
     grouped = {}
     for issue in build_data_issues(result):
+        if issue.get("score_impact") == 0 or issue.get("action") == "Informational":
+            continue
         key = (issue.get("category"), issue.get("rule_id", issue.get("type")))
         grouped.setdefault(key, []).append(weights.get(issue.get("severity", "Low"), 2))
     penalty = sum(max(values) + min(3, len(values) - 1) for values in grouped.values())
@@ -200,6 +235,41 @@ def build_report_data(
     return validate_report_consistency(report)
 
 
+def project_scope_lines(facts):
+    """Identical deterministic scope/sample wording for UI, Markdown and PDF."""
+    scope = facts.get('analysis_scope', {})
+    lines = [scope.get('statement', '')]
+    scanned = scope.get('scanned_files', [])
+    if 'scanned_files' in scope:
+        lines.append(f"已检查文件 {len(scanned)} 个；跳过条目 {len(scope.get('skipped_files', []))} 个（目录/预算条目不等于内部文件数）。")
+        lines.extend(f"已检查：{name}" for name in scanned)
+    lines.extend(f"已跳过：{s.get('path', '?')}；原因：{s.get('reason', '未提供')}" for s in scope.get('skipped_files', []))
+    if facts.get('sample_definition'):
+        lines.append(facts['sample_definition']['statement'])
+    graph = facts.get('dataset_graph', {})
+    if graph:
+        lines.append(graph['statement'])
+    for dataset in facts.get('datasets', []):
+        association = dataset.get('dataset_association')
+        if not association:
+            continue
+        roles = ', '.join(association.get('roles', []))
+        parents = ', '.join(association.get('parents', [])) or '未确认上游文件'
+        lines.append(f"数据文件：{dataset['file']}；文件内记录数：{dataset.get('rows')}；角色：{roles}；上游：{parents}；{association.get('model_context_reason', '')}")
+        for loader in association.get('loaders', []):
+            lines.append(f"读取位置：{loader['file']}；Cell {loader.get('cell')}；Line {loader['line']}；变量 {loader['variable']}；匹配方式 {loader['match']}。")
+        for writer in association.get('producers', []):
+            lines.append(f"生成位置：{writer['file']}；Cell {writer.get('cell')}；Line {writer['line']}；变量 {writer['variable']}；角色 {writer['role']}（静态依赖，未证明当前文件由该次运行生成）。")
+        for consumer in association.get('consumers', []):
+            lines.append(f"消费位置：{consumer['file']}；Cell {consumer.get('cell')}；Line {consumer['line']}；调用 {consumer['call']}；仅为静态变量依赖，不是运行血缘证明。")
+        model = dataset.get('modeling_data', {})
+        if model.get('row_reconstruction') == 'Exact':
+            lines.append(f"已重建 {dataset['file']}：Train {model.get('train_rows')} / Test {model.get('test_rows')}；仅适用于该文件的已验证数据流。")
+    for unresolved in graph.get('unresolved_reads', []):
+        lines.append(f"未能关联具体建模数据：{unresolved['file']}；Line {unresolved['line']}；变量 {unresolved['variable']}；原因 {unresolved['match']}。")
+    return [line for line in lines if line]
+
+
 def report_coverage_summary(report):
     summary = coverage_summary(report.get("review_coverage") or coverage_for_review(report["ai_review"], report.get("findings", [])))
     return "" if summary in report["ai_review"] else summary
@@ -214,13 +284,32 @@ def enhancement_summary(report):
     lines = [
         "增强功能状态（静态诊断独立保留）：",
         f"知识库：{knowledge.get('status', 'unknown')}；{knowledge.get('reason', '')}",
-        f"AI Review：{ai.get('status', 'unknown')}；{ai.get('reason', '')}",
+        f"AI Review：{ai_outcome(ai)}；{ai.get('reason', '')}",
         "知识库用于本次 AI Review：" + ("是" if ai.get("used_knowledge") else "否"),
     ]
+    if ai_outcome(ai) == "failed":
+        lines.append("增强故障类别：" + ai.get("failure_code", ai.get("status", "unknown")))
     if ai.get("previous_review_retained"):
         lines.append("本次刷新失败；以下 AI Review 为上次成功结果，不代表本次生成。")
-    lines.append("检索采用的来源：" + ("、".join(knowledge.get("sources", [])) or "无"))
-    lines.extend("采用准则：" + rule for rule in knowledge.get("rules", []))
+    for index, batch in enumerate(ai.get("batches", []), 1):
+        lines.append(f"Qwen 请求批次 {index}：输入 {batch.get('input_characters', 0)} 字符；"
+                     f"估算输入 {batch.get('estimated_input_tokens', 0)} token（字符启发式，非账单用量）；"
+                     f"真实用量：{batch.get('usage') or 'SDK 未返回'}；重试 {batch.get('retry_count', 0)} 次；"
+                     f"成功 {batch.get('success_count', batch.get('response_success_count', 0))} 条；"
+                     f"失败 {batch.get('failure_count', batch.get('response_failure_count', 0))} 条；"
+                     f"失败原因：{', '.join(batch.get('failure_reasons', [])) or '无'}；"
+                     f"request ID：{batch.get('request_id') or '未返回'}。")
+    for error in ai.get("errors", []):
+        lines.append(f"增强未完成原因：{error.get('status')}；{error.get('reason')}；request ID：{error.get('request_id') or '未返回'}。")
+    lines.append("检索返回的来源：" + ("、".join(knowledge.get("sources", [])) or "无"))
+    reference = ai.get("knowledge_reference", {})
+    if reference:
+        lines.append("请求或复用解释参考的来源：" + ("、".join(reference.get("sources", [])) or "无"))
+        lines.extend("请求参考准则：" + rule for rule in reference.get("rules", []))
+        if reference.get("excerpt"):
+            lines.append("为控制请求大小仅发送完整准则的节选，没有发送全部检索材料。")
+    else:
+        lines.extend("检索返回准则：" + rule for rule in knowledge.get("rules", []))
     return "\n\n".join(lines)
 
 
@@ -305,17 +394,9 @@ def build_markdown_report(report):
         lines.extend([
             "### 2.0s Analysis Scope",
             "",
-            f"- {analysis_scope.get('statement', '')}",
         ])
-        for skipped in analysis_scope.get("skipped_files", []):
-            lines.append(
-                f"- Not inspected: `{skipped.get('path', '?')}` — {skipped.get('reason', 'reason unavailable')}"
-            )
-        if analysis_scope.get("skipped_files"):
-            lines.append(
-                "- Impact: findings about custom transformers and project-wide coverage exclude these files."
-            )
-        lines.append("")
+        lines.extend('- ' + line for line in project_scope_lines(facts))
+        lines.append('')
 
     split_roles = facts.get("split_role_analysis", {})
     if split_roles:
@@ -331,7 +412,7 @@ def build_markdown_report(report):
                 for role, details in role_details.items()
             ),
         ])
-        for risk in split_roles.get("risks", []):
+        for risk in _unique_split_risks(split_roles.get("risks", [])):
             lines.append(f"- {risk.get('severity', 'Low')} · {risk.get('type')}: {risk.get('evidence')}")
         lines.append("")
 
@@ -363,8 +444,9 @@ def build_markdown_report(report):
             lines.extend([
                 f"### 2.{index} {issue['type']}",
                 "",
-                f"- 问题编号：{issue['id']} / {issue['problem_id']}",
+                f"- 问题编号：{issue.get('display_problem_id', issue['problem_id'])} / {issue.get('display_id', issue['id'])}",
                 f"- 验证状态：{issue['verification_label']}",
+                f"- 结果分层：{issue.get('result_class_label', '待核实问题')}",
                 f"- 严重程度：{issue['severity']}",
                 f"- 置信度：{issue.get('confidence', 'Medium')}",
                 f"- Classification: {issue.get('action', 'Review')}",
@@ -391,6 +473,7 @@ def build_markdown_report(report):
             correlation_text = "；".join(
                 f"{item['features']}: {item['value']:.3f}" for item in dataset["high_correlations"]
             ) or "未发现 |r| >= 0.95 的特征对"
+            actionable_count, informational_count = _result_layer_counts(dataset.get("issues", []))
             lines.extend([
                 f"### 3.{index} {dataset['file']}",
                 "",
@@ -400,7 +483,8 @@ def build_markdown_report(report):
                 f"- 类型情况：{dtype_text}",
                 f"- 高相关特征：{correlation_text}",
                 f"- 数据质量评分：{dataset['quality_score']}/100",
-                f"- 质量问题：{len(dataset.get('issues', []))} 条",
+                f"- 需处理问题：{actionable_count} 条",
+                f"- 信息性观察：{informational_count} 条",
                 "",
             ])
             priority = [
@@ -557,7 +641,7 @@ def build_markdown_report(report):
         f"- 说明：{caveat}",
         "",
     ])
-    return "\n".join(lines)
+    return display_text("\n".join(lines), report.get("display_ids", {}))
 
 
 def _plain_markdown(text):
@@ -567,8 +651,93 @@ def _plain_markdown(text):
     return text.strip()
 
 
+def pdf_font_status():
+    """Use an embedded CJK TTF, with a safe bundled fallback and precise errors."""
+    import os
+    import hashlib
+    try:
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.ttfonts import TTFont
+    except ImportError:
+        return {"status": "unavailable", "font_name": None, "error_code": "dependency_missing",
+                "reason": "PDF 依赖未安装；请运行 python -m pip install -r requirements.txt，Markdown 仍可下载。"}
+    project = Path(__file__).resolve().parent
+    bundled = project / "assets" / "fonts" / "NotoSansSC-Regular.ttf"
+    configured = os.environ.get("CODEDATA_PDF_FONT", "").strip()
+    candidates = []
+    if configured:
+        custom = Path(configured).expanduser()
+        if not custom.is_absolute():
+            custom = project / custom
+        candidates.append(("custom", custom))
+    if not candidates or candidates[0][1] != bundled:
+        candidates.append(("bundled", bundled))
+    failures = []
+    labels = {"font_missing": "字体文件不存在", "font_unreadable": "字体文件不可读，请检查权限",
+              "font_invalid": "文件不是受支持的有效 TTF", "glyphs_missing": "字体不包含必需的中文字形",
+              "font_registration_failed": "字体注册失败"}
+    for source, path in candidates:
+        code = None
+        try:
+            info = path.stat()
+            if not path.is_file():
+                code = "font_missing"
+            elif path.suffix.lower() != ".ttf":
+                code = "font_invalid"
+            else:
+                with path.open("rb") as stream:
+                    header = stream.read(4)
+                if header not in {b"\x00\x01\x00\x00", b"true"}:
+                    code = "font_invalid"
+                # Invalidate registered fonts when the file is replaced or repaired.
+                signature = f"{path}:{info.st_size}:{info.st_mtime_ns}"
+                prefix = "CodeData-CustomCJK-" if source == "custom" else "CodeData-NotoSansSC-"
+                name = prefix + hashlib.sha256(signature.encode()).hexdigest()[:12]
+                if code is not None:
+                    pass
+                elif name in pdfmetrics.getRegisteredFontNames():
+                    font = pdfmetrics.getFont(name)
+                else:
+                    try:
+                        font = TTFont(name, str(path))
+                    except PermissionError:
+                        raise
+                    except OSError:
+                        raise
+                    except Exception:
+                        code = "font_invalid"
+                if code is None:
+                    if not all(ord(c) in font.face.charToGlyph for c in "中文数据质量报告风险复核"):
+                        code = "glyphs_missing"
+                    else:
+                        try:
+                            if name not in pdfmetrics.getRegisteredFontNames():
+                                pdfmetrics.registerFont(font)
+                        except Exception:
+                            code = "font_registration_failed"
+                if code is None:
+                    fallback = bool(failures)
+                    return {"status": "embedded", "font_name": name, "source": source,
+                            "fallback_used": fallback, "attempts": failures,
+                            "reason": ("自定义 PDF 字体不可用，已改用项目附带的嵌入式中文字体；请检查 CODEDATA_PDF_FONT。" if fallback
+                                       else "PDF 使用嵌入式中文字体。" if source == "custom"
+                                       else "PDF 使用附带许可的嵌入式中文字体。")}
+        except FileNotFoundError:
+            code = "font_missing"
+        except (OSError, ValueError):
+            code = "font_unreadable"
+        except Exception:
+            code = "font_registration_failed"
+        failures.append({"source": source, "error_code": code, "reason": labels[code]})
+    details = "；".join(("自定义字体：" if f["source"] == "custom" else "项目字体：") + f["reason"] for f in failures)
+    return {"status": "unavailable", "font_name": None, "error_code": failures[-1]["error_code"],
+            "attempts": failures,
+            "reason": "PDF 中文字体不可用（" + details + "）。请将修复包中的 assets/fonts/ 完整复制到 app.py 所在目录，"
+                      "或用 CODEDATA_PDF_FONT 指定可嵌入的中文 TTF 文件。Markdown 仍可下载。"}
+
+
 def build_pdf_report(report):
-    """Render a clean, in-memory PDF using ReportLab's CJK CID font."""
+    """Render a clean in-memory PDF with an embedded CJK font."""
     report = validate_report_consistency(report)
     try:
         from reportlab.lib import colors
@@ -576,8 +745,6 @@ def build_pdf_report(report):
         from reportlab.lib.pagesizes import A4
         from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
         from reportlab.lib.units import mm
-        from reportlab.pdfbase import pdfmetrics
-        from reportlab.pdfbase.ttfonts import TTFont
         from reportlab.platypus import (
             KeepTogether, PageBreak, Paragraph, Preformatted, SimpleDocTemplate,
             Spacer, Table, TableStyle,
@@ -585,14 +752,10 @@ def build_pdf_report(report):
     except ImportError as exc:
         raise RuntimeError("PDF 报告依赖 reportlab，请安装 requirements.txt 后重试。") from exc
 
-    font_name = "CodeData-NotoSansSC"
-    try:
-        pdfmetrics.getFont(font_name)
-    except KeyError:
-        font_path = Path(__file__).parent / "assets" / "fonts" / "NotoSansSC-Regular.ttf"
-        if not font_path.is_file():
-            raise RuntimeError("缺少项目附带的中文字体，请恢复 assets/fonts/NotoSansSC-Regular.ttf。")
-        pdfmetrics.registerFont(TTFont(font_name, str(font_path)))
+    font = pdf_font_status()
+    if font["status"] == "unavailable":
+        raise RuntimeError(font["reason"])
+    font_name = font["font_name"]
 
     buffer = BytesIO()
     doc = SimpleDocTemplate(
@@ -611,7 +774,7 @@ def build_pdf_report(report):
         leading=14, textColor=colors.HexColor("#293241"), spaceAfter=5, wordWrap="CJK",
     )
     title_style = ParagraphStyle(
-        "CJKTitle", parent=body, fontName="Helvetica-Bold", fontSize=22,
+        "CJKTitle", parent=body, fontName=font_name, fontSize=22,
         leading=28, alignment=TA_CENTER,
         textColor=colors.HexColor("#0F172A"), spaceAfter=8,
     )
@@ -620,7 +783,7 @@ def build_pdf_report(report):
         textColor=colors.HexColor("#64748B"), spaceAfter=18,
     )
     heading = ParagraphStyle(
-        "Heading", parent=body, fontName="Helvetica-Bold", fontSize=14, leading=19,
+        "Heading", parent=body, fontName=font_name, fontSize=14, leading=19,
         textColor=colors.HexColor("#2563EB"), spaceBefore=12, spaceAfter=8, keepWithNext=True,
     )
     subheading = ParagraphStyle(
@@ -653,7 +816,7 @@ def build_pdf_report(report):
         return "<br/>".join(escaped_lines)
 
     def p(value, style=body):
-        return Paragraph(mixed_markup(value), style)
+        return Paragraph(mixed_markup(display_text(value, report.get("display_ids", {}))), style)
 
     def section(number, text):
         return Paragraph(f"{number}. {escape(text)}", heading)
@@ -688,7 +851,8 @@ def build_pdf_report(report):
     story.append(overview_table)
     story.append(p("最终结论与问题清单", subheading))
     story.extend(p(line) for line in conclusion_summary_lines(report))
-    story.extend(p(finding_summary_line(issue)) for issue in report["conclusions"]["finding_rows"])
+    # Keep one canonical issue's metadata/evidence together across page breaks.
+    story.extend(KeepTogether([p(finding_summary_line(issue))]) for issue in report["conclusions"]["finding_rows"])
     story.extend([Spacer(1, 5 * mm), section(2, "Code Quality Analysis")])
     code = report["code_quality"]
     summary_table = Table([
@@ -753,16 +917,7 @@ def build_pdf_report(report):
     analysis_scope = facts.get("analysis_scope", {})
     if analysis_scope:
         story.append(p("Analysis Scope", subheading))
-        story.append(p(analysis_scope.get("statement", "")))
-        for skipped in analysis_scope.get("skipped_files", []):
-            story.append(p(
-                f"Not inspected: {skipped.get('path', '?')} — "
-                f"{skipped.get('reason', 'reason unavailable')}"
-            ))
-        if analysis_scope.get("skipped_files"):
-            story.append(p(
-                "Custom-transformer and project-wide conclusions exclude the files above."
-            ))
+        story.extend(p(line) for line in project_scope_lines(facts))
     split_roles = facts.get("split_role_analysis", {})
     if split_roles:
         story.extend([
@@ -773,7 +928,7 @@ def build_pdf_report(report):
                 f"test={split_roles.get('test_detected', False)}"
             ),
         ])
-        for risk in split_roles.get("risks", []):
+        for risk in _unique_split_risks(split_roles.get("risks", [])):
             story.append(p(f"{risk.get('severity')} · {risk.get('type')}：{risk.get('evidence')}"))
     fairness = facts.get("fairness", {})
     if fairness.get("evaluation_exists"):
@@ -803,7 +958,7 @@ def build_pdf_report(report):
                     f"{issue.get('category', 'Code Quality')} · {issue['type']}",
                     subheading,
                 ),
-                p(f"问题编号：{issue['id']} / {issue['problem_id']}；验证状态：{issue['verification_label']}"),
+                p(f"问题编号：{issue.get('display_problem_id', issue['problem_id'])} / {issue.get('display_id', issue['id'])}；验证状态：{issue['verification_label']}"),
                 p(f"位置：{location}"),
                 p(
                     f"Affected Files ({len(issue.get('affected_files', []))})："
@@ -830,6 +985,7 @@ def build_pdf_report(report):
             correlations = "；".join(
                 f"{item['features']}: {item['value']:.3f}" for item in dataset["high_correlations"]
             ) or "未发现 |r| >= 0.95 的特征对"
+            actionable_count, informational_count = _result_layer_counts(dataset.get("issues", []))
             story.extend([
                 p(dataset["file"], subheading),
                 p(f"规模：{shape.get('rows', 0)} 行 × {shape.get('columns', 0)} 列"),
@@ -837,7 +993,8 @@ def build_pdf_report(report):
                 p(f"重复：{dataset['duplicate_rows']} 行（{dataset['duplicate_rate']:.2%}）"),
                 p(f"高相关特征：{correlations}"),
                 p(f"数据质量评分：{dataset['quality_score']}/100"),
-                p(f"质量问题：{len(dataset.get('issues', []))} 条"),
+                p(f"需处理问题：{actionable_count} 条"),
+                p(f"信息性观察：{informational_count} 条"),
             ])
             for issue in [
                 item for item in dataset.get("issues", [])
@@ -927,7 +1084,7 @@ def build_pdf_report(report):
     finding_text = render_finding_evidence([f for f in report.get("findings", []) if f["id"] not in report["ai_review"]])
     in_code = False
     code_lines = []
-    for raw_line in (finding_text + "\n" + report["ai_review"]).splitlines():
+    for raw_line in display_text(finding_text + "\n" + report["ai_review"], report.get("display_ids", {})).splitlines():
         stripped = raw_line.strip()
         if stripped.startswith("```"):
             if in_code:

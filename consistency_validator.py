@@ -6,6 +6,9 @@ from copy import deepcopy
 import re
 import json
 import hashlib
+from review_semantics import (annotation_mismatch, grounded_numbers, scoped_context,
+                              explanation_entry_issue, explanation_text_issue)
+from ui_review_helpers import display_id_map, display_text, normalized_ai
 
 
 SPLIT_CONTRADICTIONS = (
@@ -38,14 +41,21 @@ STATUS_LABELS = {
     "confirmed_error": "已证实错误", "static_risk": "静态分析风险",
     "needs_review": "需要人工复核",
 }
+RESULT_CLASS_LABELS = {
+    "confirmed_defect": "已证实缺陷",
+    "static_risk": "静态风险",
+    "needs_verification": "待核实问题",
+    "informational_observation": "信息性观察",
+}
 
 
 
 class ReviewText(str):
     """Keep typed coverage metadata alongside the legacy Markdown string API."""
-    def __new__(cls, value, coverage=None):
+    def __new__(cls, value, coverage=None, ai_status=None):
         instance = super().__new__(cls, value)
         instance.coverage = deepcopy(coverage or {})
+        instance.ai_status = deepcopy(ai_status or {})
         return instance
 
 
@@ -56,6 +66,17 @@ def is_priority_finding(finding):
         or finding.get("action") == "Fix"
         or finding.get("verification_status") == "confirmed_error"
     )
+
+
+def finding_result_class(finding):
+    """Return the mutually-exclusive user-facing layer for one Finding."""
+    if finding.get("action") == "Informational" or finding.get("score_impact") == 0:
+        return "informational_observation"
+    if finding.get("verification_status") == "confirmed_error":
+        return "confirmed_defect"
+    if finding.get("verification_status") == "static_risk":
+        return "static_risk"
+    return "needs_verification"
 
 
 def group_findings(findings):
@@ -75,17 +96,24 @@ def group_findings(findings):
         grouped.setdefault(pid, []).append(finding)
     problems = []
     for pid, members in sorted(grouped.items()):
+        classes = {finding_result_class(f) for f in members}
+        result_class = next(
+            name for name in ("confirmed_defect", "static_risk", "needs_verification", "informational_observation")
+            if name in classes
+        )
         problems.append({
             "id": pid, "finding_ids": [f["id"] for f in members],
             "priority": any(is_priority_finding(f) for f in members),
             "category": members[0].get("category") or members[0]["type"],
+            "result_class": result_class,
+            "result_class_label": RESULT_CLASS_LABELS[result_class],
             "needs_verification": any(f["verification_status"] != "confirmed_error" for f in members),
             "deduplication_reason": "底层明确给出相同事件标识" if members[0].get("deduplication_key") else "规则、位置和证据完全相同",
         })
     return problems
 
 
-def deterministic_explanation(finding):
+def deterministic_explanation(finding, facts=None):
     """Use only a known rule and its evidence boundary; never infer runtime harm."""
     rule = str(finding.get("rule_id") or "未提供规则编号")
     label = STATUS_LABELS.get(finding["verification_status"], finding["verification_status"])
@@ -98,6 +126,9 @@ def deterministic_explanation(finding):
         impact = "缺失值是否影响模型输入取决于实际使用字段和处理路径，需要结合数据流复核。"
     else:
         impact = "请核对该证据对实际执行路径或数据使用的影响；静态发现不能证明性能损失。"
+    for measured in scoped_context(finding, facts or {}).get("measured_operations", []):
+        if measured.get("removed") is not None:
+            cause += f" 已精确重建该操作删除 {measured['removed']} 行（处理前 {measured.get('before')} 行，处理后 {measured.get('after')} 行）。"
     return {"cause": cause, "potential_impact": impact,
             "recommendation": finding["recommendation"]}
 
@@ -137,7 +168,10 @@ def build_review_coverage(findings, annotations=None):
 def coverage_for_review(review, findings):
     metadata = getattr(review, "coverage", {})
     # Recompute against current findings; stale metadata never supplies counts.
-    return build_review_coverage(findings, metadata.get("accepted_annotations", {}))
+    coverage = build_review_coverage(findings, metadata.get("accepted_annotations", {}))
+    coverage["unverified_suggestions"] = deepcopy(metadata.get("unverified_suggestions", []))
+    coverage["rejected_explanations"] = deepcopy(metadata.get("rejected_explanations", []))
+    return coverage
 
 
 def coverage_summary(coverage):
@@ -155,11 +189,15 @@ def ensure_review_coverage(review, facts):
     findings = findings_from_facts(facts)
     if isinstance(review, ReviewText):
         current = coverage_for_review(review, findings)
-        if current == review.coverage:
-            return review
         entries = [{"finding_id": fid, **fields} for fid, fields in
                    current["accepted_annotations"].items()]
-        return render_structured_review({"explanations": entries}, facts)
+        restored = render_structured_review({"explanations": entries, "unverified_suggestions": review.coverage.get("unverified_suggestions", [])}, facts)
+        for rejection in review.coverage.get("rejected_explanations", []):
+            if rejection not in restored.coverage["rejected_explanations"]:
+                restored.coverage["rejected_explanations"].append(deepcopy(rejection))
+        restored.ai_status = (deepcopy(review.ai_status) if current.get("accepted_annotations") == restored.coverage.get("accepted_annotations")
+                              else normalized_ai(getattr(review, "ai_status", {}), restored.coverage))
+        return restored
     coverage = build_review_coverage(findings)
     if not findings:
         return ReviewText(review or "本次没有正式 Finding。", coverage)
@@ -168,7 +206,7 @@ def ensure_review_coverage(review, facts):
              "正文未提供可校验的结构化解释记录，以下摘要由底层事实生成，不计入 AI 已解释。"]
     for problem in coverage["items"]:
         member = next((by_id[fid] for fid in problem["finding_ids"] if is_priority_finding(by_id[fid])), by_id[problem["finding_ids"][0]])
-        explanation = deterministic_explanation(member)
+        explanation = deterministic_explanation(member, facts)
         refs = problem["id"] + "（" + "、".join(problem["finding_ids"]) + "）"
         lines.append(f"- {refs}〔结构化事实补齐〕：原因：{explanation['cause']}影响：{explanation['potential_impact']}建议：{explanation['recommendation']}")
     return ReviewText("\n\n".join(lines), coverage)
@@ -276,8 +314,12 @@ def build_findings(code_result, data_results):
             "message": issue.get("message", ""),
             "category": issue.get("category", ""),
             "action": issue.get("action"), "priority": issue.get("priority"),
+            "score_impact": issue.get("score_impact"),
+            "model_input_status": issue.get("model_input_status"),
+            "artifact_role": issue.get("artifact_role"),
             "deduplication_key": issue.get("deduplication_key"),
         })
+        findings[-1]["result_class"] = finding_result_class(findings[-1])
     return sorted(findings, key=lambda item: item["id"])
 
 
@@ -302,6 +344,7 @@ def render_finding_evidence(findings):
             f"### {item['id']} · {item['type']}",
             f"- 位置：{position or '未提供位置'}",
             f"- 严重程度：{item['severity']}；置信度：{item['confidence']}；验证状态：{STATUS_LABELS.get(item['verification_status'], item['verification_status'])}",
+            f"- 结果分层：{RESULT_CLASS_LABELS.get(item.get('result_class') or finding_result_class(item), '待核实问题')}",
             f"- 证据：{item['evidence'] or '未提供具体证据'}",
         ])
         if item.get("detected_count") is not None:
@@ -341,7 +384,7 @@ def sanitize_explanation(text, facts, finding=None):
         reason = None
         if re.search(
             r"(?<![A-Za-z_])\d+(?:\.\d+)?|[一二三四五六七八九十百千万]+(?:行|条|组|个|倍|百分点)", clause,
-        ):
+        ) and not (finding and grounded_numbers(clause, finding, facts)):
             reason = "数量和比例以对应 Finding 的原始证据为准，未采用模型补充的数值。"
         elif STRONG_IMPACT_RE.search(clause):
             reason = "未提供运行对照，无法确认模型性能变化的方向和幅度。"
@@ -368,7 +411,7 @@ def render_structured_review(payload, facts):
     """Join model explanations by ID; omitted/unknown IDs never alter formal findings."""
     findings = findings_from_facts(facts)
     known = {item["id"]: item for item in findings}
-    annotations, limitations = {}, []
+    annotations, limitations, rejections = {}, [], []
     if not isinstance(payload, dict):
         payload = {}
         limitations.append("模型未返回有效的结构化解释；以下保留全部原始诊断和建议。")
@@ -384,14 +427,36 @@ def render_structured_review(payload, facts):
         if fid in annotations:
             limitations.append("同一 Finding 的重复解释未重复采用。")
             continue
-        annotations[fid] = {}
+        content_issue = explanation_entry_issue(entry)
+        if content_issue:
+            reason = "解释内容不完整：" + content_issue
+            limitations.append(reason)
+            rejections.append({"finding_id": fid, "reason": reason})
+            continue
+        mismatch = annotation_mismatch(entry, known[fid], facts)
+        if mismatch:
+            limitations.append(mismatch)
+            rejections.append({"finding_id": fid, "reason": mismatch})
+            continue
+        cleaned = {}
+        incomplete = None
         for key in ("cause", "potential_impact", "recommendation"):
             clean, notes = sanitize_explanation(entry.get(key, ""), facts, known[fid])
-            clean, consistency_notes = validate_agent_consistency(clean, facts, ensure_findings=False)
-            annotations[fid][key] = clean
+            consistency_notes = []
+            # Local sanitization already checks runtime claims and scoped quantities.
+            if clean and explanation_text_issue(clean):
+                incomplete = f"{key}：净化后的解释不再构成完整陈述。"
+            cleaned[key] = clean
             limitations.extend(notes + consistency_notes)
+        if incomplete or any(not cleaned.get(key) for key in ("cause", "potential_impact", "recommendation")):
+            reason = "解释内容不完整：" + (incomplete or "必要字段在事实校验后为空。")
+            limitations.append(reason)
+            rejections.append({"finding_id": fid, "reason": reason})
+            continue
+        annotations[fid] = cleaned
     coverage = build_review_coverage(findings, annotations)
-    lines = ["## 1. 项目总结", "本报告以静态分析事实为依据；AI 仅补充解释，未执行模型训练或性能对照。",
+    coverage["rejected_explanations"] = rejections
+    lines = ["## 1. 项目总结", *( ["本次未生成可校验的结构化 AI 解释；以下保留完整静态诊断与确定性摘要。"] if not any(any(fields.values()) for fields in annotations.values()) else []), "本报告保留完整静态诊断，以分析事实为依据；AI 仅补充解释，未执行模型训练或性能对照。",
              coverage_summary(coverage), "", "## 2. 发现的问题", render_problem_index(coverage),
              render_finding_evidence(findings) or "本次未产生结构化 Finding；这不代表项目没有问题。"]
     for heading, key in [("## 3. 问题原因", "cause"), ("## 4. 影响分析", "potential_impact"), ("## 5. 优化建议", "recommendation")]:
@@ -401,7 +466,7 @@ def render_structured_review(payload, facts):
             members = sorted([known[fid] for fid in problem["finding_ids"]], key=lambda f: (not is_priority_finding(f), f["id"]))
             source = next((annotations[fid][key] for fid in problem["finding_ids"]
                            if annotations.get(fid, {}).get(key)), None)
-            value = source or deterministic_explanation(members[0])[key]
+            value = source or deterministic_explanation(members[0], facts)[key]
             # Important problems always have individual explanations. Other
             # problems may share a concise category/interpretation summary.
             group_key = (problem["id"] if problem["priority"] else problem["category"], value,
@@ -411,6 +476,7 @@ def render_structured_review(payload, facts):
             refs = "、".join(p["id"] + "（" + "、".join(p["finding_ids"]) + "）" for p in problems)
             field_label = {"cause": "原因", "potential_impact": "潜在影响", "recommendation": "建议"}[key]
             lines.append(f"- {refs}〔{origin}〕：{field_label}：{value}")
+    coverage["unverified_suggestions"] = []
     suggestions = payload.get("unverified_suggestions", [])
     if isinstance(suggestions, list):
         for suggestion in suggestions[:10]:
@@ -420,6 +486,7 @@ def render_structured_review(payload, facts):
             clean, consistency_notes = validate_agent_consistency(clean, facts, ensure_findings=False)
             limitations.extend(notes + consistency_notes)
             if clean:
+                coverage["unverified_suggestions"].append(clean)
                 lines.append("- 待验证建议（不计入原始检测数量）：" + clean)
     lines.extend(["", "## 6. 修改代码示例", "以 Repair 模块中经校验的修改建议为准；AI Review 不生成未经验证的可执行 Patch。",
                   "", "### 验证限制", "未执行运行对照，无法确认模型性能影响；数据或变量未提供时不能推断其取值和业务含义。"])
@@ -458,7 +525,11 @@ def build_analysis_facts(
             "duplicate_rows": result.get("duplicate_rows", 0),
             "duplicate_rate": result.get("duplicate_rate", 0),
             "duplicate_groups": result.get("duplicate_groups", 0),
+            "numeric_statistics": deepcopy(result.get("numeric_statistics", {})),
             "formal_data_issues": result.get("issues", []),
+            "dataset_association": result.get("dataset_association", {}),
+            "modeling_data": result.get("duplicate_split_analysis", {}).get("modeling_data", {}),
+            "quantified_impacts": result.get("quantified_impacts", []),
         })
     return {
         "findings": build_findings(code_result, data_results),
@@ -468,7 +539,9 @@ def build_analysis_facts(
         "target": flow.get("target"),
         "fit": flow.get("fit", []),
         "predict": flow.get("predict", []),
-        "detected_metrics": [item.get("label") for item in flow.get("metrics", [])],
+        "detected_metrics": list(dict.fromkeys(
+            item.get("label") for item in flow.get("metrics", []) if item.get("label")
+        )),
         "metric_details": flow.get("metrics", []),
         "evaluation_detected": bool(flow.get("evaluation_detected")),
         "task_type": flow.get("task_type", {"type": "Unknown", "confidence": "Low"}),
@@ -594,7 +667,7 @@ def validate_agent_consistency(agent_text, facts, *, ensure_findings=True):
         result += "\n\n### 原始 Finding 补充（保持底层检测结果）\n" + render_finding_evidence(missing)
         corrections.append("已补回 AI 正文遗漏的原始 Finding。")
     if isinstance(agent_text, ReviewText):
-        result = ReviewText(result, typed_coverage)
+        result = ReviewText(result, typed_coverage, getattr(agent_text, "ai_status", {}))
     return result, list(dict.fromkeys(corrections))
 
 
@@ -608,7 +681,7 @@ def report_fingerprint(report):
 
 
 def is_final_report(report):
-    return bool(report and report.get("schema_version") == FINAL_REPORT_SCHEMA
+    return bool(report and report.get("schema_version") == FINAL_REPORT_SCHEMA and report.get("review_policy_version") == 3
                 and report.get("final_fingerprint") == report_fingerprint(report))
 
 
@@ -624,8 +697,13 @@ def _issue_projection(finding, problem_id, original=None):
         "message": finding["message"], "reason": finding["message"],
         "recommendation": finding["recommendation"], "verification_status": finding["verification_status"],
         "verification_label": STATUS_LABELS.get(finding["verification_status"], "需要人工复核"),
+        "result_class": finding.get("result_class") or finding_result_class(finding),
+        "result_class_label": RESULT_CLASS_LABELS[finding.get("result_class") or finding_result_class(finding)],
         "category": finding.get("category") or issue.get("category", "Quality"),
         "action": finding.get("action") or "Review",
+        "score_impact": finding.get("score_impact"),
+        "model_input_status": finding.get("model_input_status"),
+        "artifact_role": finding.get("artifact_role"),
         "count": finding.get("detected_count"), "rate": finding.get("detected_rate"),
         "affected_rows": finding.get("affected_rows", []),
         "problem": finding["type"], "detail": finding["evidence"],
@@ -638,6 +716,11 @@ def finalize_report_projection(checked):
     """Project every displayed issue/number from final findings and analyzer facts."""
     findings, facts = checked["findings"], checked["analysis_facts"]
     problems = group_findings(findings)
+    ids = display_id_map(findings, problems)
+    checked["display_ids"] = ids
+    for problem in problems:
+        problem["display_id"] = ids["problems"][problem["id"]]
+        problem["display_finding_ids"] = [ids["findings"][fid] for fid in problem["finding_ids"]]
     membership = {fid: problem["id"] for problem in problems for fid in problem["finding_ids"]}
     source = checked.get("source_snapshot", {})
     if "overview" in source:
@@ -661,6 +744,8 @@ def finalize_report_projection(checked):
                              for issue in entry.get("result", entry).get("issues", [])
                              if issue.get("rule_id") == finding["rule_id"] and issue.get("column") == loc["column"]), {})
         issue = _issue_projection(finding, membership[finding["id"]], original)
+        issue["display_id"] = ids["findings"][finding["id"]]
+        issue["display_problem_id"] = ids["problems"][membership[finding["id"]]]
         rows.append(issue)
         if finding["origin"] == "code":
             code.append({"file": loc["file"], **({"cell": loc["cell"]} if loc["cell"] is not None else {}), "issues": [issue]})
@@ -694,13 +779,21 @@ def finalize_report_projection(checked):
     checked["data_quality"]["project_issues"] = project_issues
     points = checked.get("overall", {}).get("breakdown", {}).get("代码质量", 0)
     checked["code_quality"]["score"] = round(points / 35 * 100) if checked.get("project_overview", {}).get("python_file_count") else 0
-    counts = {"total": len(problems), "confirmed_error": 0, "static_risk": 0, "needs_review": 0}
+    counts = {"total": len(problems), "confirmed_error": 0, "static_risk": 0, "needs_review": 0,
+              "confirmed_defect": 0, "needs_verification": 0, "informational_observation": 0}
     by_id = {f["id"]: f for f in findings}
     for problem in problems:
         states = {by_id[fid]["verification_status"] for fid in problem["finding_ids"]}
         state = "needs_review" if "needs_review" in states or not states <= set(STATUS_LABELS) else "static_risk" if "static_risk" in states else "confirmed_error"
         problem["verification_status"] = state
         counts[state] += 1
+        # ``static_risk`` is both the legacy verification key and the new
+        # result-layer key, so it is already counted above.
+        if problem["result_class"] != "static_risk":
+            counts[problem["result_class"]] += 1
+    counts["actionable_total"] = (
+        counts["confirmed_defect"] + counts["static_risk"] + counts["needs_verification"]
+    )
     repairs = checked.get("repair_suggestions", [])
     counts.update({"ai_explained": checked["review_coverage"]["ai_explained"],
                    "verification_pending": checked["review_coverage"]["manual_review"],
@@ -715,9 +808,10 @@ def finalize_report_projection(checked):
         "data_flow": facts.get("data_flow", {}), "quantified_impacts": facts.get("quantified_impacts", []),
         "artifact_analysis": facts.get("artifact_analysis", {}), "health": checked.get("overall", {}),
         "project_overview": checked.get("project_overview", {}), "repair_suggestions": repairs,
-        "patch_text": checked["patch_text"], "agent_report": checked["ai_review"],
+        "patch_text": checked["patch_text"], "agent_report": display_text(checked["ai_review"], ids),
         "enhancement_status": checked.get("enhancement_status", {}),
     }
+    checked["review_policy_version"] = 3
     checked["schema_version"] = FINAL_REPORT_SCHEMA
     checked["final_fingerprint"] = report_fingerprint(checked)
     return checked
@@ -725,8 +819,8 @@ def finalize_report_projection(checked):
 
 def conclusion_summary_lines(report):
     c = report["conclusions"]["counts"]
-    return [f"检测问题总数：{c['total']}；已证实错误：{c['confirmed_error']}；风险提示：{c['static_risk']}；待人工复核：{c['needs_review']}。",
-            "统计按去重后的 P- 问题编号计算，三类验证结论互斥且合计为总数；原始 F- 证据逐条保留。",
+    return [f"检测记录总数：{c['total']}；需处理问题：{c['actionable_total']}；已证实缺陷：{c['confirmed_defect']}；静态风险：{c['static_risk']}；待核实问题：{c['needs_verification']}；信息性观察：{c['informational_observation']}。",
+            "统计按去重后的 P 问题编号计算，四类结果分层互斥且合计为检测记录总数；信息性观察不计入需处理数量或质量扣分，原始 F 证据逐条保留。",
             f"修复建议：{c['repairs']}；静态或运行验证通过：{c['validated_repairs']}；{report['conclusions']['patch_status']}。"]
 
 
@@ -735,8 +829,9 @@ def finding_summary_line(issue):
         f"Cell {issue['cell']}" if issue.get("cell") is not None else None,
         f"Line {issue['line']}" if issue.get("line") is not None else None,
         f"Column {issue['column']}" if issue.get("column") is not None else None] if value is not None)
-    return (f"{issue['id']} / {issue['problem_id']} · {issue['type']} · {loc} · "
-            f"严重程度：{issue['severity']} · 置信度：{issue['confidence']} · {issue['verification_label']} · 证据：{issue['evidence']}")
+    return (f"{issue.get('display_problem_id', issue['problem_id'])} / {issue.get('display_id', issue['id'])} · {issue['type']} · {loc} · "
+            f"结果分层：{issue.get('result_class_label', '待核实问题')} · 严重程度：{issue['severity']} · "
+            f"置信度：{issue['confidence']} · {issue['verification_label']} · 证据：{issue['evidence']}")
 
 
 
@@ -751,8 +846,15 @@ def validate_report_consistency(report):
         blocked.add("CODE_NO_VALIDATION_SPLIT")
     if facts.get("evaluation_detected"):
         blocked.add("CODE_NO_EVALUATION")
-    facts["findings"] = [f for f in findings_from_facts(facts) if f.get("rule_id") not in blocked]
-    facts["formal_code_issues"] = [i for i in facts.get("formal_code_issues", []) if i.get("rule_id") not in blocked]
+    scoped_flows = facts.get('data_flow', {}).get('files', []) if facts.get('dataset_graph') else []
+    def contradicted(rule, file):
+        if not scoped_flows:
+            return rule in blocked
+        matching = [flow for flow in scoped_flows if flow.get('file') == file]
+        return any((rule == 'CODE_NO_VALIDATION_SPLIT' and flow.get('split', {}).get('detected'))
+                   or (rule == 'CODE_NO_EVALUATION' and flow.get('evaluation_detected')) for flow in matching)
+    facts["findings"] = [f for f in findings_from_facts(facts) if not contradicted(f.get('rule_id'), f.get('location', {}).get('file'))]
+    facts["formal_code_issues"] = [i for i in facts.get("formal_code_issues", []) if not contradicted(i.get('rule_id'), i.get('file'))]
     checked["analysis_facts"] = facts
     review = checked.get("ai_review", "")
     recorded = checked.get("review_coverage", {})
@@ -766,6 +868,8 @@ def validate_report_consistency(report):
     checked["ai_review"] = corrected_ai
     checked["findings"] = findings_from_facts(facts)
     checked["review_coverage"] = coverage_for_review(corrected_ai, checked["findings"])
+    if checked.get("enhancement_status", {}).get("ai"):
+        checked["enhancement_status"]["ai"] = normalized_ai(checked["enhancement_status"]["ai"], checked["review_coverage"])
 
     # Revalidate executable suggestions at the final report boundary.  This
     # prevents a later formatter/caller from reintroducing a field or variable

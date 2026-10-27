@@ -3,12 +3,14 @@
 from contextlib import contextmanager
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from static_review_rules import is_dependency_manifest
+from project_archive import ArchiveBudget, ProjectFiles, inspect_zip, safe_relative_path, private_path, supported_path
 
 
 MAX_FILE_SIZE = 25 * 1024 * 1024
 CODE_SUFFIXES = {".py", ".ipynb"}
 DATA_SUFFIXES = {".csv"}
-PROJECT_SUFFIXES = CODE_SUFFIXES | DATA_SUFFIXES
+PROJECT_SUFFIXES = CODE_SUFFIXES | DATA_SUFFIXES | {".md", ".txt", ".yml", ".yaml", ".toml", ".zip"}
 
 
 def validate_uploaded_file(uploaded_file, allowed_suffixes):
@@ -18,6 +20,8 @@ def validate_uploaded_file(uploaded_file, allowed_suffixes):
 
     safe_name = Path(uploaded_file.name).name
     suffix = Path(safe_name).suffix.lower()
+    if suffix in {".txt", ".yml", ".yaml", ".toml"} and not is_dependency_manifest(safe_name):
+        raise ValueError("仅支持 requirements*.txt、environment.yml/yaml 或 pyproject.toml 依赖文件")
 
     if suffix not in allowed_suffixes:
         expected = "、".join(sorted(allowed_suffixes))
@@ -71,10 +75,25 @@ def materialize_project_uploads(uploaded_files):
     if not uploaded_files:
         raise ValueError("尚未选择项目文件")
 
-    validated = []
+    validated, pre_skipped = [], []
+    compressed_bytes = 0
     seen_names = set()
     for uploaded_file in uploaded_files:
-        safe_name, _, content = validate_uploaded_file(uploaded_file, PROJECT_SUFFIXES)
+        safe_name = safe_relative_path(uploaded_file.name)
+        if not safe_name or private_path(safe_name):
+            raise ValueError("上传路径不安全或属于敏感配置；未读取内容")
+        if not supported_path(safe_name) and Path(safe_name).suffix.lower() != '.zip':
+            raise ValueError("仅支持代码、CSV、Markdown、Makefile、ZIP 及受支持的依赖清单")
+        if len(validated) >= 100 or compressed_bytes >= 100 * 1024 * 1024:
+            pre_skipped.append({"path": safe_name, "reason": "上传文件数或总容量超过预算，未读取内容", "size_mb": None})
+            continue
+        content = uploaded_file.getvalue()
+        if not content or len(content) > MAX_FILE_SIZE:
+            raise ValueError(f"{safe_name} 为空或超过 25 MB 限制")
+        compressed_bytes += len(content)
+        if compressed_bytes > 100 * 1024 * 1024:
+            pre_skipped.append({"path": safe_name, "reason": "上传总容量超过 100 MB", "size_mb": None})
+            continue
         if safe_name.lower() in seen_names:
             raise ValueError(f"存在同名文件：{safe_name}，请重命名后重新上传")
         seen_names.add(safe_name.lower())
@@ -82,9 +101,19 @@ def materialize_project_uploads(uploaded_files):
 
     with TemporaryDirectory(prefix="codedata_project_") as temp_dir:
         temp_path = Path(temp_dir)
-        materialized = []
+        materialized = ProjectFiles(skipped_files=pre_skipped)
+        budget = ArchiveBudget()
         for safe_name, content in validated:
+            if Path(safe_name).suffix.lower() == '.zip':
+                inspect_zip(content, safe_name, temp_path / 'archives', materialized, materialized.skipped_files, budget)
+                continue
+            if budget.files >= budget.max_files or budget.bytes_read + len(content) > budget.max_total_bytes:
+                materialized.skipped_files.append({"path": safe_name, "reason": "项目文件数或总字节数超过共享预算", "size_mb": None})
+                continue
             path = temp_path / safe_name
+            path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(content)
             materialized.append((safe_name, path))
+            budget.files += 1
+            budget.bytes_read += len(content)
         yield materialized

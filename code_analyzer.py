@@ -6,6 +6,7 @@ import ast
 import re
 
 import nbformat
+from static_review_rules import analyze_additional_rules, notebook_context, has_imported_cv_call
 
 from data_flow_analyzer import analyze_notebook_data_flow, analyze_python_data_flow
 from notebook_syntax import preprocess_notebook_source
@@ -338,7 +339,7 @@ def redact_sensitive_code(code):
     return "".join(lines)
 
 
-def analyze_code_with_ast(code):
+def analyze_code_with_ast(code, dependencies=None, *, initial_aliases=None, initial_frames=None):
     """Analyze one Python source unit using ordered AST evidence and conservative heuristics."""
     try:
         tree = ast.parse(code)
@@ -448,7 +449,7 @@ def analyze_code_with_ast(code):
         ):
             dataset_split_nodes.append(assignment)
             slice_roles.update(filter(None, (_role_from_name(name) for name in target_names)))
-    slice_split_detected = "train" in slice_roles and bool({"validation", "test"} & slice_roles)
+    slice_split_detected = bool(slice_split_nodes) and "train" in slice_roles and bool({"validation", "test"} & slice_roles)
     split_detected = bool(split_calls or dataset_split_nodes or slice_split_detected)
     split_line = min(
         [call.lineno for call in split_calls]
@@ -629,13 +630,6 @@ def analyze_code_with_ast(code):
                 "优先使用向量化操作、assign/apply 或批处理；先以性能测试验证收益。",
                 call, code,
             ))
-        if short_name == "append" and receiver in dataframe_vars:
-            issues.append(_issue(
-                "CODE_PANDAS_APPEND", "Pandas", "Deprecated Pandas API",
-                "Low", "High", "检测到 DataFrame.append()，该 API 已弃用。",
-                "使用 pd.concat([...], ignore_index=...) 替代，并验证索引行为。",
-                call, code,
-            ))
 
     for split in split_calls:
         if not _has_keyword(split, "random_state"):
@@ -728,7 +722,7 @@ def analyze_code_with_ast(code):
             "结合误差尺度补充 MAE、RMSE、R²、残差分析或业务指标。",
             metric_calls[0], code,
         ))
-    if fit_calls and not any(_call_name(call).split(".")[-1] in CV_NAMES for call in calls):
+    if fit_calls and not any(_call_name(call).split(".")[-1] in CV_NAMES for call in calls) and not has_imported_cv_call(code, initial_aliases or {}, CV_NAMES):
         issues.append(_issue(
             "CODE_NO_CROSS_VALIDATION", "Validation", "No Cross-validation Detected",
             "Low", "Medium", "检测到模型训练，但未发现常见交叉验证调用。",
@@ -877,6 +871,7 @@ def analyze_code_with_ast(code):
                 call, code,
             ))
 
+    issues.extend(analyze_additional_rules(code, dependencies, initial_aliases, initial_frames))
     # Collapse only exact duplicate findings; retain distinct lines and evidence.
     deduplicated = []
     seen = set()
@@ -913,7 +908,7 @@ def _strip_notebook_magics(source):
     return preprocess_notebook_source(source)["code"]
 
 
-def analyze_notebook(notebook_path):
+def analyze_notebook(notebook_path, dependencies=None):
     """Analyze code cells plus execution-order and output metadata."""
     with open(notebook_path, "r", encoding="utf-8") as handle:
         notebook = nbformat.read(handle, as_version=4)
@@ -921,11 +916,12 @@ def analyze_notebook(notebook_path):
     execution = []
     code_cells = [(index, cell) for index, cell in enumerate(notebook.cells, 1) if cell.cell_type == "code"]
 
-    for cell_index, cell in code_cells:
+    contexts = notebook_context([preprocess_notebook_source(cell.source)["code"] for _, cell in code_cells])
+    for (cell_index, cell), (aliases, frames) in zip(code_cells, contexts):
         if isinstance(cell.execution_count, int):
             execution.append((cell_index, cell.execution_count))
         notebook_syntax = preprocess_notebook_source(cell.source)
-        cell_issues = analyze_code_with_ast(notebook_syntax["code"])
+        cell_issues = analyze_code_with_ast(notebook_syntax["code"], dependencies, initial_aliases=aliases, initial_frames=frames)
         for construct in notebook_syntax["constructs"]:
             source = construct.get("source", "")
             if re.match(r"^\s*!\s*(?:pip|conda)\s+install\b", source, re.I):
@@ -997,6 +993,15 @@ def analyze_notebook(notebook_path):
     flow = analyze_notebook_data_flow(notebook_path)
     split_detected = bool(flow.get("split", {}).get("detected"))
     evaluation_detected = bool(flow.get("evaluation_detected"))
+    cv_detected = False
+    contexts = notebook_context([preprocess_notebook_source(cell.source)["code"] for _, cell in code_cells])
+    for (_, cell), (aliases, _) in zip(code_cells, contexts):
+        try:
+            cell_tree = ast.parse(preprocess_notebook_source(cell.source)["code"])
+        except SyntaxError:
+            continue
+        if any(isinstance(node, ast.Call) and _call_name(node).split(".")[-1] in CV_NAMES for node in ast.walk(cell_tree)) or has_imported_cv_call(preprocess_notebook_source(cell.source)["code"], aliases, CV_NAMES):
+            cv_detected = True
     reconciled = []
     for result in results:
         issues = [
@@ -1004,6 +1009,7 @@ def analyze_notebook(notebook_path):
             if not (
                 (split_detected and issue.get("rule_id") == "CODE_NO_VALIDATION_SPLIT")
                 or (evaluation_detected and issue.get("rule_id") == "CODE_NO_EVALUATION")
+                or (cv_detected and issue.get("rule_id") == "CODE_NO_CROSS_VALIDATION")
             )
         ]
         if issues:

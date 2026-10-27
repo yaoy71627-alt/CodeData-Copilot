@@ -78,6 +78,47 @@ def _role_from_name(name):
     return None
 
 
+def _distinct_metric_evaluations(uses):
+    """Collapse multiple metrics (or role-tagged args) over one prediction event."""
+    distinct = {}
+    for use in uses:
+        if use.get("purpose") != "metric":
+            continue
+        target = use.get("target")
+        prediction = use.get("prediction")
+        # When argument expressions are unavailable, retain the source location
+        # rather than guessing that independent calls are the same evaluation.
+        signature = (
+            use.get("file"), use.get("cell"), target, prediction,
+        ) if target or prediction else (
+            use.get("file"), use.get("cell"), use.get("line"), use.get("variable"),
+        )
+        distinct.setdefault(signature, use)
+    return list(distinct.values())
+
+
+def _deduplicate_split_risks(risks):
+    """Remove only identical analyzer summaries; preserve independent events."""
+    unique = []
+    seen = set()
+    for risk in risks:
+        evidence = tuple(
+            (
+                item.get("file"), item.get("cell"), item.get("line"),
+                item.get("purpose"), item.get("target"), item.get("prediction"),
+                item.get("selection_type"), tuple(item.get("candidate_models", [])),
+            )
+            for item in risk.get("evidence", []) if isinstance(item, dict)
+        )
+        key = (
+            risk.get("rule_id"), risk.get("type"), risk.get("selection_type"), evidence,
+        )
+        if key not in seen:
+            unique.append(risk)
+            seen.add(key)
+    return unique
+
+
 def _loop_selection_details(node, parents):
     current = (parents or {}).get(node)
     loop = None
@@ -1091,6 +1132,9 @@ class _FlowBuilder:
                         "variable": variable,
                         "purpose": purpose,
                         "object": receiver,
+                        "metric": short_name if purpose in {"metric", "test selection"} else None,
+                        "target": args[0] if purpose in {"metric", "test selection"} and args else None,
+                        "prediction": args[1] if purpose in {"metric", "test selection"} and len(args) > 1 else None,
                         "in_loop": in_loop,
                         **selection_details,
                         **_event_location(call, self.flow["file"], cell),
@@ -1301,10 +1345,7 @@ class _FlowBuilder:
                 "selection_type": selection_type,
                 "evidence": test_selection,
             })
-        repeated_test_evaluation = [
-            use for use in roles["test"]["uses"]
-            if use.get("purpose") == "metric"
-        ]
+        repeated_test_evaluation = _distinct_metric_evaluations(roles["test"]["uses"])
         if len(repeated_test_evaluation) > 1 and not test_selection:
             risks.append({
                 "rule_id": "CODE_REPEATED_TEST_EVALUATION_RISK",
@@ -1329,7 +1370,7 @@ class _FlowBuilder:
             "validation_detected": bool(roles["validation"]["variables"]),
             "test_detected": bool(roles["test"]["variables"]),
             "split_roles": roles,
-            "risks": risks,
+            "risks": _deduplicate_split_risks(risks),
         }
 
         fairness = flow["fairness"]
@@ -1403,7 +1444,7 @@ def analyze_python_data_flow(code, file_name=None):
     return builder.finish()
 
 
-def analyze_notebook_data_flow(notebook_path):
+def analyze_notebook_data_flow(notebook_path, file_name=None):
     with open(notebook_path, "r", encoding="utf-8") as handle:
         notebook = nbformat.read(handle, as_version=4)
     code_cells = [
@@ -1420,7 +1461,7 @@ def analyze_notebook_data_flow(notebook_path):
         ordered = sorted(code_cells, key=lambda item: item[1].execution_count)
     else:
         ordered = code_cells
-    builder = _FlowBuilder(Path(notebook_path).name)
+    builder = _FlowBuilder(file_name or Path(notebook_path).name)
     for cell_index, cell in ordered:
         builder.process(preprocess_notebook_source(cell.source)["code"], cell=cell_index)
     flow = builder.finish()
@@ -1527,13 +1568,12 @@ def merge_data_flows(flows):
         risks.extend(analysis.get("risks", []))
     for role in roles:
         roles[role]["variables"] = list(dict.fromkeys(roles[role]["variables"]))
-    repeated_test_evaluation = [
-        use for use in roles["test"]["uses"]
-        if use.get("purpose") == "metric"
-    ]
+    repeated_test_evaluation = _distinct_metric_evaluations(roles["test"]["uses"])
     if (
-        len(repeated_test_evaluation) > 1
-        and not any(risk.get("rule_id") == "CODE_TEST_SET_OVERUSE" for risk in risks)
+        len(candidates) == 1 and len(repeated_test_evaluation) > 1
+        and not any(risk.get("rule_id") in {
+            "CODE_TEST_SET_OVERUSE", "CODE_REPEATED_TEST_EVALUATION_RISK",
+        } for risk in risks)
     ):
         risks.append({
             "rule_id": "CODE_REPEATED_TEST_EVALUATION_RISK",
@@ -1547,7 +1587,7 @@ def merge_data_flows(flows):
         "validation_detected": bool(roles["validation"]["variables"]),
         "test_detected": bool(roles["test"]["variables"]),
         "split_roles": roles,
-        "risks": risks,
+        "risks": _deduplicate_split_risks(risks),
     }
     primary["split"]["detected"] = any(
         flow.get("split", {}).get("detected") for flow in candidates
@@ -1601,25 +1641,27 @@ def merge_data_flows(flows):
 
 
 def _flow_for_dataset(flow, csv_path):
-    """Select the file-level lineage that most clearly reads ``csv_path``."""
+    """Select a unique matching reader, never rank an unrelated pipeline by score."""
     candidates = list((flow or {}).get("files") or [flow or {}])
     wanted = Path(csv_path).name.casefold()
-
-    def score(candidate):
+    matching = []
+    for candidate in candidates:
         paths = [source.get("path") for source in candidate.get("source_data", [])]
-        matches = sum(
-            Path(str(path)).name.casefold() == wanted
-            for path in paths if isinstance(path, str)
-        )
-        return (
-            20 * matches
-            + 4 * bool(candidate.get("split", {}).get("detected"))
-            + 2 * bool(candidate.get("operations"))
-            + 2 * bool(candidate.get("model_features") or candidate.get("selected_features"))
-            + bool(candidate.get("target"))
-        )
-
-    return max(candidates, key=score) if candidates else (flow or {})
+        if any(isinstance(path, str) and Path(path.replace("\\", "/")).name.casefold() == wanted for path in paths):
+            matching.append(candidate)
+    if len(matching) == 1:
+        return matching[0]
+    if matching:
+        signatures = {tuple(u.get("code") for u in candidate.get("code_units", [])) for candidate in matching}
+        if len(signatures) == 1 and next(iter(signatures)):
+            return matching[0]
+    if len(candidates) == 1 and not candidates[0].get("source_data"):
+        # Legacy direct callers can explicitly supply a CSV for one implicit frame.
+        # The project pipeline always adds strict_dataset_binding before replay.
+        return candidates[0]
+    return {**_empty_flow(), "strict_dataset_binding": True,
+            "association_status": "unassociated", "bound_csv_path": str(csv_path),
+            "association_reason": "未能关联具体建模数据：没有唯一匹配的代码读取来源。"}
 
 
 def _replay_selector(spec):
@@ -1777,6 +1819,11 @@ def reconstruct_modeling_data(flow, csv_path, data_result=None):
         "operation_impacts": [],
         "flow_file": selected_flow.get("file"),
     }
+    if selected_flow.get("strict_dataset_binding") and (
+        selected_flow.get("association_status") != "matched"
+        or str(csv_path) != selected_flow.get("bound_csv_path")
+    ):
+        return {**base, "reason": selected_flow.get("association_reason") or "未能关联具体建模数据。"}
     try:
         original = read_csv_for_analysis(csv_path)
     except Exception as exc:
@@ -2463,5 +2510,7 @@ def flow_summary_text(flow):
         last_predict = flow["predict"][-1]
         parts.append(f"predict({last_predict.get('X') or '?'})")
     if flow.get("metrics"):
-        parts.append(", ".join(item["label"] for item in flow["metrics"]))
+        parts.append(", ".join(dict.fromkeys(
+            item["label"] for item in flow["metrics"] if item.get("label")
+        )))
     return " → ".join(parts) if parts else "Unable to verify automatically."

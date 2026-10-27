@@ -1,0 +1,18 @@
+{
+  "source_archive": "CodeData-Copilot-PDF-Font-Fixed-Full.zip",
+  "scope": "仅最后一次中文字体修复涉及的代码，不包含 A—D 的其他累计改动。",
+  "files": [
+    {
+      "file": "app.py",
+      "sha256": "01a63afebdf339300028ffde8c8b117b624bb00070e21b01ae5d2c1e2e4b628b"
+    },
+    {
+      "file": "report.py",
+      "sha256": "8939c83d880e55fdfc4d1a22734e5b487d986628fffe99f96fdf133424f19284"
+    },
+    {
+      "file": "tests/test_pdf_font_recovery.py",
+      "sha256": "6dbca19590cbaa577a4b634456dc38e07f0f8f1ba8f0d054380c6f2ac194f821"
+    }
+  ]
+}

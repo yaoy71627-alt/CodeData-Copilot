@@ -1,0 +1,102 @@
+{
+  "git_base_commit": "2a4ff67f7bdd50604e3585291fca37fd07de298d",
+  "python": "3.12.14",
+  "dependencies": {
+    "pytest": "9.1.1",
+    "streamlit": "1.66.0",
+    "pandas": "2.2.3",
+    "scikit-learn": "1.8.0",
+    "numpy": "2.3.5",
+    "nbformat": "5.11.1",
+    "openai": "3.35.1",
+    "reportlab": "4.4.9",
+    "pypdf": "6.10.0",
+    "python-dotenv": "1.2.4"
+  },
+  "changed_files": [
+    "agent.py",
+    "app.py",
+    "consistency_validator.py",
+    "pytest.ini",
+    "qwen_runtime.py",
+    "report.py",
+    "review_semantics.py",
+    "tests/fixtures/batch_b/ibm/emp_attrition.csv",
+    "tests/fixtures/batch_b/telco/README.md",
+    "tests/fixtures/batch_c/telco/data/processed/test_df.csv",
+    "tests/fixtures/batch_c/telco/data/processed/train_df.csv",
+    "tests/fixtures/batch_c/telco/data/raw/IBM-Telco-Customer-Churn.csv",
+    "tests/fixtures/batch_d/truth.json",
+    "tests/test_final_report_consistency.py",
+    "tests/test_full_regression_acceptance.py",
+    "tests/test_review_accuracy.py",
+    "tests/test_review_binding_ui.py",
+    "ui_review_helpers.py"
+  ],
+  "restored_fixtures": [
+    {
+      "path": "tests/fixtures/batch_d/truth.json",
+      "sha256": "c0c1de91897e30d0f5d7b6545d3f212d0b5bbf19b3c8a590889c09007c03f278"
+    },
+    {
+      "path": "tests/fixtures/batch_c/telco/data/processed/test_df.csv",
+      "sha256": "4e428497fdfb4ff5814f3a294c0a3914bd46fca0179fb25c7fd1e56f3b3e0a9e"
+    },
+    {
+      "path": "tests/fixtures/batch_c/telco/data/processed/train_df.csv",
+      "sha256": "34b46c0101305e7b99420408ccca9ff7d1e60da372107f8c753ee722984dfd7b"
+    },
+    {
+      "path": "tests/fixtures/batch_c/telco/data/raw/IBM-Telco-Customer-Churn.csv",
+      "sha256": "a0ea74c48c1063be89a73ce3fb868593604c0129f2bf581934f04983d728b3b5"
+    },
+    {
+      "path": "tests/fixtures/batch_b/ibm/emp_attrition.csv",
+      "sha256": "a5c31e38bd7fafc9bc333884eb181b06b41b8e5e488e8f7ccb27199fb3be7659"
+    },
+    {
+      "path": "tests/fixtures/batch_b/telco/README.md",
+      "sha256": "b933cbc3946de342e8777b68b37ab3fb54a73e7ed6249bdfbaff278f8e3cfd65"
+    }
+  ],
+  "tests": {
+    "targeted_passed": 149,
+    "full_passed": 538,
+    "subtests_passed": 17,
+    "failed": 0,
+    "skipped": 1,
+    "warnings": 0,
+    "skip_reason": "Explicit online paid API E2E not enabled"
+  },
+  "source_sha256": {
+    "agent.py": "8e28cf1154661eda0746be65aacfe3b9f6866ac89385a82f6bd6fcd23b43b809",
+    "app.py": "2135e547d325b607952a2c9953ef8596eb92fd516537679529815a0a54a5bc95",
+    "consistency_validator.py": "af341b6d7c61c53c03ea0eba13988c7bd6e043d17219033f26931885528d85a3",
+    "pytest.ini": "963b5beb41568ec7c6538f15ec92485b60bf55abc25ed320e80b17e6c1a39238",
+    "qwen_runtime.py": "9c0720f661a8563ca1872fa00c448f287e10c93037e4883c53b3ed45a4d59659",
+    "report.py": "71fe9a4f0f86d8290551a7c69da5767276d67e81715bdd281e062832e4a2df6b",
+    "review_semantics.py": "993e3f48654c34eb8ff0cab568fda00691e34c907e8b3fc98056cdae5e803def",
+    "tests/fixtures/batch_b/ibm/emp_attrition.csv": "a5c31e38bd7fafc9bc333884eb181b06b41b8e5e488e8f7ccb27199fb3be7659",
+    "tests/fixtures/batch_b/telco/README.md": "b933cbc3946de342e8777b68b37ab3fb54a73e7ed6249bdfbaff278f8e3cfd65",
+    "tests/fixtures/batch_c/telco/data/processed/test_df.csv": "4e428497fdfb4ff5814f3a294c0a3914bd46fca0179fb25c7fd1e56f3b3e0a9e",
+    "tests/fixtures/batch_c/telco/data/processed/train_df.csv": "34b46c0101305e7b99420408ccca9ff7d1e60da372107f8c753ee722984dfd7b",
+    "tests/fixtures/batch_c/telco/data/raw/IBM-Telco-Customer-Churn.csv": "a0ea74c48c1063be89a73ce3fb868593604c0129f2bf581934f04983d728b3b5",
+    "tests/fixtures/batch_d/truth.json": "c0c1de91897e30d0f5d7b6545d3f212d0b5bbf19b3c8a590889c09007c03f278",
+    "tests/test_final_report_consistency.py": "f1e9b6bfdc7eabee3b5ad868ea29ea97d8c95678ff1e7493563da22c5d437393",
+    "tests/test_full_regression_acceptance.py": "dd472b9533fab0ea09d14b181c811fb01ac80e8e532179e0e9d0cdc907412586",
+    "tests/test_review_accuracy.py": "9cfa534bda112702f349931237ee14c2640c49bccbc66ffd8005d9881a35defc",
+    "tests/test_review_binding_ui.py": "22ba93025a34d3ee685c6603ca5726e5e034907f7505605e902b88e79fc77f86",
+    "ui_review_helpers.py": "adf3d91c50587cf994ab9e682e777eca7efe5d96244303c508223335087bcf10"
+  },
+  "protected_modules_unchanged": [
+    "data_analyzer.py",
+    "data_flow_analyzer.py",
+    "code_analyzer.py",
+    "github_loader.py",
+    "patch_generator.py",
+    "repair_validator.py"
+  ],
+  "new_regression_test_cases": 29,
+  "latest_upload": "CodeData-Copilot(1)(2).zip",
+  "latest_upload_source_equal_previous": true
+}

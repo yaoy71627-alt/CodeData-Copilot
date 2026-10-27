@@ -1,9 +1,11 @@
+from ui_review_helpers import review_notice, ai_outcome, is_analysis_warning
 import ast
 from datetime import datetime
 import html
 from io import BytesIO
 from pathlib import Path
 import re
+import nbformat
 
 import pandas as pd
 import streamlit as st
@@ -12,6 +14,7 @@ from agent import (
     build_repair_suggestions,
     safe_retrieve_knowledge,
     classify_ai_error,
+    ai_review_status,
     run_agent,
 )
 from code_analyzer import (
@@ -38,6 +41,14 @@ from consistency_validator import (
     conclusion_summary_lines,
 )
 from file_loader import decode_python_file, materialize_project_uploads, materialize_uploads
+from static_review_rules import (
+    is_dependency_manifest, read_dependencies, documentation_split_findings,
+    slice_sample_findings,
+)
+from notebook_syntax import preprocess_notebook_source
+from project_lineage import (build_dataset_graph, bind_dataset_flow, sample_summary,
+                             scoped_dataset_consistency, classify_dataset_role,
+                             apply_dataset_role_policy)
 from github_loader import load_github_project
 from patch_generator import build_unified_patch
 from repair_validator import validate_repair_suggestions
@@ -48,7 +59,9 @@ from report import (
     build_data_issues,
     build_markdown_report,
     build_pdf_report,
+    pdf_font_status,
     build_report_data,
+    project_scope_lines,
     summarize_results,
 )
 
@@ -95,6 +108,7 @@ def init_state():
         "report_markdown": None,
         "report_pdf": None,
         "report_error": None,
+        "pdf_font_status": pdf_font_status(),
         "last_analyzed_at": None,
         "active_page": "Home",
         "import_mode": "Local Project",
@@ -102,6 +116,8 @@ def init_state():
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
+    # Font resources may be restored while the Streamlit session remains open.
+    st.session_state.pdf_font_status = defaults["pdf_font_status"]
 
 
 def read_csv_preview(uploaded_file):
@@ -184,6 +200,8 @@ def analyze_project_files(files, generate_ai=True, project_metadata=None, progre
     skipped_files = list(getattr(files, "skipped_files", []))
     files = list(files)
     artifact_analysis = detect_duplicate_artifacts(files)
+    dependency_documents, code_units = [], []
+    lineage_documents, scanned_files = [], []
 
     notify(0, "running")
     for name, path in files:
@@ -196,6 +214,9 @@ def analyze_project_files(files, generate_ai=True, project_metadata=None, progre
                 sources.extend(cells)
                 code_names.append(name)
                 parsed_code.append((name, "notebook", path))
+                notebook = nbformat.read(str(path), as_version=4)
+                code_units.extend({"file": name, "cell": index, "code": preprocess_notebook_source(cell.source)["code"]}
+                                  for index, cell in enumerate(notebook.cells, 1) if cell.cell_type == "code")
                 safe_cells = [redact_sensitive_code(cell) for cell in cells]
                 code_context.append({"file": name, "excerpt": limited_excerpt("\n\n".join(safe_cells))})
             elif suffix == ".py":
@@ -203,76 +224,126 @@ def analyze_project_files(files, generate_ai=True, project_metadata=None, progre
                 sources.append(source)
                 code_names.append(name)
                 parsed_code.append((name, "python", source))
+                code_units.append({"file": name, "code": source})
                 code_context.append({"file": name, "excerpt": limited_excerpt(redact_sensitive_code(source))})
             elif suffix == ".md":
                 documentation_names.append(name)
-                documentation.append({"file": name, "excerpt": limited_excerpt(read_text_file(path), 4000)})
+                documentation.append({"file": name, "excerpt": read_text_file(path)[:200000]})
+                lineage_documents.append(documentation[-1])
+            elif path.name.lower() == 'makefile':
+                lineage_documents.append({"file": name, "excerpt": read_text_file(path)[:200000]})
+            elif is_dependency_manifest(name):
+                dependency_documents.append((name, read_text_file(path)[:200000]))
+            else:
+                skipped_files.append({"path": name, "reason": "不支持的文件类型", "size_mb": None})
         except Exception as exc:
             warnings.append(f"{name}：解析失败（{exc}）。")
+            skipped_files.append({"path": name, "reason": f"文件解析失败（{type(exc).__name__}）", "size_mb": None})
     notify(0, "complete", f"已识别 {len(files)} 个候选文件")
 
     notify(1, "running")
+    dependencies = read_dependencies(dependency_documents)
     for name, kind, content in parsed_code:
         try:
             if kind == "python":
-                issues = analyze_code_with_ast(content)
+                issues = analyze_code_with_ast(content, dependencies)
                 file_flows.append(analyze_python_data_flow(content, file_name=name))
                 if issues:
                     code_result.append({"file": name, "issues": issues})
             else:
-                file_flows.append(analyze_notebook_data_flow(str(content)))
-                for notebook_result in analyze_notebook(str(content)):
+                file_flows.append(analyze_notebook_data_flow(str(content), file_name=name))
+                for notebook_result in analyze_notebook(str(content), dependencies):
                     code_result.append({"file": name, **notebook_result})
         except Exception as exc:
             warnings.append(f"{name}：代码质量分析失败（{exc}）。")
+            skipped_files.append({"path": name, "reason": f"代码分析失败（{type(exc).__name__}）", "size_mb": None})
     notify(1, "complete", f"完成 {len(code_names)} 个代码文件的静态检查")
 
-    data_flow = merge_data_flows(file_flows)
+    dataset_graph = build_dataset_graph(code_units, csv_files, lineage_documents)
+    dataset_flows = {}
+    quantified_impacts = []
     notify(2, "running")
     for name, path in csv_files:
         try:
-            data_report = analyze_csv(str(path), data_flow=data_flow)
+            bound_flow = bind_dataset_flow(dataset_graph, name, path, file_flows)
+            dataset_flows[name] = bound_flow
+            data_report = analyze_csv(str(path), data_flow=bound_flow)
+            association = next(d for d in dataset_graph["datasets"] if d["file"] == name)
+            role_info = classify_dataset_role(name, data_report, association)
+            if role_info["primary_role"] not in {"unassociated"}:
+                association["roles"] = role_info["roles"]
+            association["file_role"] = role_info
+            apply_dataset_role_policy(data_report, role_info)
+            data_report["dataset_association"] = association
+            data_report["dataset_association"]["model_context_status"] = bound_flow["association_status"]
+            data_report["dataset_association"]["model_context_reason"] = bound_flow.get("association_reason", "已匹配单一数据来源；重建仍按允许列表验证。")
+            data_report["quantified_impacts"] = [dict(item, source_csv=name, flow_file=bound_flow.get('file')) for item in quantify_data_impacts(bound_flow, path, data_report)] if bound_flow["association_status"] == "matched" else []
+            quantified_impacts.extend(data_report["quantified_impacts"])
+            if bound_flow["association_status"] == "matched":
+                dataset_flows[name] = enrich_model_features(bound_flow, data_report)
             if not data_report["shape"]["rows"] or not data_report["shape"]["columns"]:
                 warnings.append(f"{name}：数据集为空，评分会反映这一情况。")
             data_results.append({"file": name, "result": data_report})
             data_names.append(name)
         except Exception as exc:
             warnings.append(f"{name}：数据质量分析失败（{exc}）。")
-    data_consistency_issues = analyze_dataset_consistency(data_results)
+            skipped_files.append({"path": name, "reason": f"数据分析失败（{type(exc).__name__}）", "size_mb": None})
+    data_consistency_issues = scoped_dataset_consistency(data_results, dataset_graph)
     if data_results and data_consistency_issues:
-        data_results[0]["project_issues"] = data_consistency_issues
-    if data_results:
-        data_flow = enrich_model_features(data_flow, data_results[0]["result"])
-    code_result = reconcile_code_issues_with_flow(code_result, data_flow)
+        min(data_results, key=lambda entry: entry['file'])["project_issues"] = data_consistency_issues
+    # Reconcile absence claims within each code file, never against another pipeline.
+    code_result = [resolved for location in code_result for resolved in reconcile_code_issues_with_flow(
+        [location], next((f for f in file_flows if f.get('file') == location.get('file')), {})
+    )]
+    enriched_files = {flow.get('file'): flow for flow in dataset_flows.values() if flow.get('association_status') == 'matched'}
+    data_flow = merge_data_flows([enriched_files.get(flow.get('file'), flow) for flow in file_flows])
+    if len(csv_files) != 1 or not dataset_flows or next(iter(dataset_flows.values())).get('association_status') != 'matched':
+        data_flow.update({'model_features': [], 'target': None, 'split': {}, 'feature_matrix': None,
+                          'association_reason': '未能关联唯一的项目建模数据；按数据文件分别展示，不合并推断。'})
+    data_flow['dataset_graph'] = dataset_graph
+    data_flow['dataset_contexts'] = {name: {'status': f.get('association_status'), 'file': f.get('file'), 'reason': f.get('association_reason')} for name, f in dataset_flows.items()}
+    code_result.extend(documentation_split_findings(code_units, documentation))
+    code_result.extend(slice_sample_findings(code_units, {
+        item["file"]: item["result"]["shape"]["rows"] for item in data_results
+    }))
     code_result = consolidate_duplicate_code_issues(code_result, artifact_analysis)
-    quantified_impacts = []
-    if csv_files and data_results:
-        quantified_impacts = quantify_data_impacts(
-            data_flow, csv_files[0][1], data_results[0]["result"]
-        )
-        data_results[0]["result"]["quantified_impacts"] = quantified_impacts
+    failed_paths = {s['path'] for s in skipped_files}
+    scanned_files = [name for name, _ in files if name not in failed_paths]
     analysis_facts = build_analysis_facts(
         code_result,
         data_results,
         data_flow,
         quantified_impacts=quantified_impacts,
         duplicate_split_analysis=(
-            data_results[0]["result"].get("duplicate_split_analysis", {})
-            if data_results else {}
+            data_results[0]["result"].get("duplicate_split_analysis", {}) if len(data_results) == 1 else
+            {"status": "Per dataset", "datasets": {e['file']: e['result'].get('duplicate_split_analysis', {}) for e in data_results}}
         ),
         business_rule_results=(
-            data_results[0]["result"].get("business_rule_results", [])
-            if data_results else []
+            [dict(rule, source_csv=entry['file']) for entry in data_results for rule in entry['result'].get('business_rule_results', [])]
         ),
         artifact_analysis=artifact_analysis,
+        skipped_files=skipped_files,
     )
+    analysis_facts['dataset_graph'] = dataset_graph
+    analysis_facts['sample_definition'] = sample_summary(dataset_graph, data_results)
+    analysis_facts['analysis_scope']['scanned_files'] = scanned_files
+    unassociated = [entry['file'] for entry in data_results if entry['result']['dataset_association']['model_context_status'] != 'matched']
+    partial = bool(skipped_files or dataset_graph['unresolved_reads'] or unassociated)
+    analysis_facts['analysis_scope'].update({
+        'coverage_complete': not partial, 'status': 'partial' if partial else 'complete_for_imported_files',
+        'unassociated_datasets': unassociated,
+        'statement': ('分析不完整：存在跳过文件或无法确认的数据来源；精确建模数量仅在已验证的文件上下文内给出。' if partial else
+                      '已完成本次导入可见文件的静态检查；不代表完整运行验证或未导入内容已检查。'),
+    })
     notify(2, "complete", f"完成 {len(data_results)} 个数据文件的质量检查")
 
     if not code_names and not data_results and not documentation_names:
         raise ValueError("没有成功分析的文件。请检查文件格式与内容。")
-    health = calculate_project_score(code_result, data_results, code_files_count=len(code_names))
+    health = calculate_project_score(code_result, data_results, code_files_count=len(code_names), dataset_graph=dataset_graph)
+    if partial:
+        health['caveat'] += ' 分析不完整：评分只覆盖已检查内容，不能视为整个项目的质量评价。'
     overview = build_project_overview(
-        [name for name, _ in files], sources, data_results, project_metadata or {}
+        scanned_files, sources, data_results, project_metadata or {}
     )
     project_context = {
         "project_information": project_metadata or {},
@@ -314,11 +385,12 @@ def analyze_project_files(files, generate_ai=True, project_metadata=None, progre
                 agent_report, analysis_facts
             )
             warnings.extend(consistency_notes)
-            enhancement_status["ai"] = {
-                "status": "success", "reason": "Qwen Review 已生成。",
-                "used_knowledge": bool(relevant_knowledge),
-            }
-            notify(4, "complete", "Qwen Review 已生成")
+            enhancement_status["ai"] = ai_review_status(agent_report, relevant_knowledge)
+            if ai_outcome(enhancement_status["ai"]) == "failed":
+                agent_error = enhancement_status["ai"]["reason"]
+                warnings.append(agent_error)
+            notify(4, "complete" if enhancement_status["ai"]["status"] in {"success", "partial_success", "not_needed"} else "error",
+                   enhancement_status["ai"]["reason"])
         except Exception as exc:
             enhancement_status["ai"] = {**classify_ai_error(exc), "used_knowledge": False}
             agent_error = enhancement_status["ai"]["reason"]
@@ -363,9 +435,9 @@ def analyze_project_files(files, generate_ai=True, project_metadata=None, progre
     st.session_state.quantified_impacts = quantified_impacts
     st.session_state.artifact_analysis = artifact_analysis
     st.session_state.data_result = data_results[0]["result"] if data_results else None
-    st.session_state.enhancement_status = enhancement_status
-    st.session_state.agent_report = agent_report
-    st.session_state.analysis_error = agent_error
+    st.session_state.enhancement_status = report_data.get("enhancement_status", enhancement_status)
+    st.session_state.agent_report = report_data["ai_review"] if generate_ai else None
+    st.session_state.analysis_error = (st.session_state.enhancement_status["ai"].get("reason") if ai_outcome(st.session_state.enhancement_status["ai"]) == "failed" else None)
     st.session_state.analysis_warnings = warnings
     st.session_state.health = health
     st.session_state.project_overview = overview
@@ -407,6 +479,10 @@ def run_full_analysis(code_file, data_file, generate_ai=True, progress_callback=
 def run_uploaded_project(uploaded_files, generate_ai=True, progress_callback=None):
     """Analyze a local multi-file project without changing the legacy upload route."""
     with materialize_project_uploads(uploaded_files) as files:
+        if not files:
+            st.session_state.skipped_files = files.skipped_files
+            detail = '；'.join(item['reason'] for item in files.skipped_files[:3])
+            raise ValueError('上传内容没有可分析的文件。' + detail)
         analyze_project_files(
             files, generate_ai, {"source": "Local upload"}, progress_callback
         )
@@ -473,8 +549,21 @@ def run_with_analysis_status(operation):
             raise
 
 
+def render_review_notice():
+    notice = review_notice(st.session_state.enhancement_status,
+                           st.session_state.analysis_warnings, st.session_state.analysis_error)
+    if notice:
+        st.warning(notice["message"])
+        if notice["details"]:
+            with st.expander("增强功能详细信息", expanded=False):
+                for detail in notice["details"]:
+                    st.write(detail)
+
+
 def refresh_ai_review():
     """Refresh enhancement only; static evidence and repairs stay intact on failure."""
+    st.session_state.analysis_warnings = [w for w in st.session_state.analysis_warnings if is_analysis_warning(w)]
+    st.session_state.analysis_error = None
     context, knowledge_status = safe_retrieve_knowledge(
         st.session_state.code_result, st.session_state.data_results,
         st.session_state.project_context,
@@ -485,13 +574,20 @@ def refresh_ai_review():
             st.session_state.code_result, st.session_state.data_results,
             st.session_state.project_context, knowledge_context=context,
             analysis_facts=st.session_state.analysis_facts,
+            previous_review=st.session_state.agent_report,
         )
         review, notes = validate_agent_consistency(review, st.session_state.analysis_facts or {})
-        st.session_state.analysis_warnings.extend(notes)
-        st.session_state.agent_report = review
-        st.session_state.analysis_error = None
-        status["ai"] = {"status": "success", "reason": "Qwen Review 已生成。",
-                        "used_knowledge": bool(context)}
+        # Keep file-analysis faults; review diagnostics belong to this request.
+        status["ai"] = ai_review_status(review, context)
+        status["ai"]["validation_notes"] = notes
+        if status["ai"]["status"] in {"success", "partial_success", "not_needed"}:
+            st.session_state.agent_report = review
+        else:
+            status["ai"]["previous_review_retained"] = bool(st.session_state.agent_report)
+            if not st.session_state.agent_report:
+                st.session_state.agent_report = review
+        st.session_state.analysis_error = (None if status["ai"]["status"] in {"success", "partial_success", "not_needed"}
+                                           else status["ai"]["reason"])
     except Exception as exc:
         status["ai"] = {**classify_ai_error(exc), "used_knowledge": False}
         st.session_state.analysis_error = status["ai"]["reason"]
@@ -531,6 +627,11 @@ def publish_final_report(report):
     """Publish one finalized object and bind both exported formats to its revision."""
     report = validate_report_consistency(report)
     st.session_state.report_data = report
+    st.session_state.enhancement_status = report.get("enhancement_status", {})
+    if st.session_state.agent_report is not None:
+        st.session_state.agent_report = report["ai_review"]
+    ai = st.session_state.enhancement_status.get("ai", {})
+    st.session_state.analysis_error = ai.get("reason") if ai_outcome(ai) == "failed" else None
     st.session_state.repair_suggestions = report["repair_suggestions"]
     st.session_state.patch_text = report["patch_text"]
     st.session_state.report_markdown = build_markdown_report(report)
@@ -574,15 +675,16 @@ def require_results():
 
 def render_summary():
     overview = current_report()["project_overview"]
-    stats = {"files": overview.get("file_count", 0), "code_files": overview.get("python_file_count", 0),
-             "data_files": overview.get("data_file_count", 0)}
     score = final_view("health", {})["score"] if final_view("health", {}) else 0
+    counts = current_report()["conclusions"]["counts"]
+    ai_status = ai_outcome(final_view("enhancement_status", {}).get("ai", {})) or "not generated"
     items = (
         ("Overall", f"{score}/100", "primary"),
-        ("Code", str(stats["code_files"]), "neutral"),
-        ("Data", str(stats["data_files"]), "teal"),
-        ("Issues", str(current_report()["conclusions"]["counts"]["total"]), "warning"),
-        ("Files", str(stats["files"]), "neutral"),
+        ("Confirmed", str(counts["confirmed_defect"]), "danger"),
+        ("Static risks", str(counts["static_risk"]), "warning"),
+        ("Verify", str(counts["needs_verification"]), "warning"),
+        ("Observations", str(counts["informational_observation"]), "neutral"),
+        ("AI Review", ai_status, "teal" if ai_status == "success" else "neutral"),
     )
     cells = "".join(
         f'<div class="stat-cell stat-{tone}"><span>{html.escape(label)}</span>'
@@ -597,6 +699,8 @@ def issue_quality_score(issues):
     weights = {"High": 14, "Medium": 6, "Low": 1.5}
     grouped = {}
     for issue in issues or []:
+        if issue.get("score_impact") == 0 or issue.get("action") == "Informational":
+            continue
         key = (issue.get("category", "Quality"), issue.get("rule_id", issue.get("type")))
         grouped.setdefault(key, []).append(weights.get(issue.get("severity", "Low"), 1.5))
     penalty = sum(max(values) + min(2, max(0, len(values) - 1) * 0.5)
@@ -609,8 +713,8 @@ def issue_table(issues, include_file=False):
     rows = []
     for issue in issues or []:
         row = {
-            "ID": issue.get("id", "—"),
-            "Problem ID": issue.get("problem_id", "—"),
+            "ID": issue.get("display_id", issue.get("id", "—")),
+            "Problem ID": issue.get("display_problem_id", issue.get("problem_id", "—")),
             "Verification": issue.get("verification_label", "需要人工复核"),
             "Cell": issue.get("cell") if issue.get("cell") is not None else "—",
             "Severity": str(issue.get("severity", "Unspecified")),
@@ -689,6 +793,11 @@ def render_project_health_panel():
 def render_skipped_files():
     """Show a persistent, inspectable record of repository exclusions."""
     skipped = st.session_state.skipped_files or []
+    facts = st.session_state.analysis_facts or {}
+    if facts.get('analysis_scope'):
+        with st.expander('分析范围与数据来源', expanded=not facts['analysis_scope'].get('coverage_complete', True)):
+            for line in project_scope_lines(facts):
+                st.write(line)
     if not skipped:
         return
     with st.expander(f"Skipped files · {len(skipped)} 个项目未纳入分析", expanded=False):
@@ -885,18 +994,22 @@ def render_project_input():
         '<p>Files stay in the local analysis session.</p></div>',
         unsafe_allow_html=True,
     )
-    import_mode = st.segmented_control(
+    # ``segmented_control`` in Streamlit 1.51 serializes a single-selection
+    # string as an iterable on AppTest/session reruns ("Local Project" becomes
+    # ``L``, ``o``, ...).  A horizontal radio has the same two-way semantics
+    # and keeps a scalar value across both browser and test reruns.
+    import_mode = st.radio(
         "Import method",
         ["Local Project", "GitHub Repository"],
         key="import_mode",
         label_visibility="collapsed",
-        width="stretch",
+        horizontal=True,
     )
     if import_mode == "Local Project":
-        st.caption("支持 .py、.ipynb、.csv；一次可选择多个文件，单文件最大 25 MB。")
+        st.caption("支持代码、CSV、README、依赖清单和 ZIP；ZIP 保留相对目录并受文件数、容量和解压安全预算限制。单个上传文件最大 25 MB。Makefile 可放在 ZIP 中。")
         uploaded_files = st.file_uploader(
             "Drop project files here",
-            type=["py", "ipynb", "csv"],
+            type=["py", "ipynb", "csv", "md", "txt", "yml", "yaml", "toml", "zip"],
             accept_multiple_files=True,
             key="project_upload",
         )
@@ -944,7 +1057,7 @@ def render_project_input():
             )
         github_ai = st.checkbox("Generate Qwen AI Review", value=True, key="github_ai")
         st.caption(
-            "仅分析 .py、.ipynb、.csv、.md；最多 100 个文件。导入内容在临时目录中处理并自动清理。"
+            "分析代码、CSV、Markdown、Makefile 和依赖清单；ZIP 内 CSV 也按安全预算导入。最多 100 个文件；跳过内容及原因列入报告。"
         )
         if analyze_github:
             try:
@@ -966,14 +1079,15 @@ def render_project_input():
                     render_skipped_files()
 
     if st.session_state.analyzed_files:
-        if st.session_state.analysis_error:
-            st.warning(f"基础分析已完成，但 AI 报告生成失败：{st.session_state.analysis_error}")
-        for warning in st.session_state.analysis_warnings:
-            st.warning(warning)
+        render_review_notice()
         render_skipped_files()
 
 
 init_state()
+if st.session_state.pdf_font_status["status"] != "embedded":
+    st.sidebar.warning(st.session_state.pdf_font_status["reason"])
+elif st.session_state.pdf_font_status.get("fallback_used"):
+    st.sidebar.warning(st.session_state.pdf_font_status["reason"])
 if st.session_state.active_page not in NAVIGATION:
     st.session_state.active_page = "Home"
 if st.session_state.import_mode not in {"Local Project", "GitHub Repository"}:
@@ -1042,6 +1156,10 @@ elif page == "Data Quality":
         choices = {entry["file"]: entry["result"] for entry in final_view("data_results", [])}
         selected_file = st.selectbox("选择 CSV 文件", list(choices))
         result = choices[selected_file]
+        association = result.get('dataset_association', {})
+        if association:
+            st.caption('数据角色：' + ', '.join(association.get('roles', [])) + '；' + association.get('model_context_reason', ''))
+        st.caption('当前图表仅对应所选 CSV；原始与派生文件的行数不能直接相加作为独立样本总数。')
 
         shape = result.get("shape", {})
         column_count = shape.get("columns", 0)
@@ -1194,7 +1312,9 @@ elif page == "Code Analysis":
             )
             flow_right.metric(
                 "Metrics",
-                ", ".join(item.get("label", "") for item in flow.get("metrics", [])) or "Unable to verify",
+                ", ".join(dict.fromkeys(
+                    item.get("label", "") for item in flow.get("metrics", []) if item.get("label")
+                )) or "Unable to verify",
             )
             features = flow.get("model_features", [])
             st.caption(
@@ -1410,10 +1530,14 @@ elif page in ("AI Review", "Repair"):
             if knowledge_status:
                 st.caption(knowledge_status["reason"])
             ai_status = final_view("enhancement_status", {}).get("ai", {})
-            summary_right.metric("Qwen review", ai_status.get("status") or
+            summary_right.metric("Qwen review", ai_outcome(ai_status) or
                                  ("Ready" if final_view("agent_report", None) else "Not generated"))
+            render_review_notice()
+            if ai_status:
+                if ai_status.get("batches") or ai_status.get("errors"):
+                    with st.expander("Qwen 请求诊断（无密钥及完整提示词）", expanded=False):
+                        st.json(ai_status)
             if st.session_state.analysis_error:
-                st.warning(st.session_state.analysis_error)
                 if ai_status.get("previous_review_retained"):
                     st.caption("下方保留上次成功生成的 AI Review；本次刷新未完成。")
 
@@ -1511,5 +1635,9 @@ elif page == "Report":
                 "PDF 暂未生成。Markdown 报告仍可正常下载。"
                 + (f" 原因：{st.session_state.report_error}" if st.session_state.report_error else "")
             )
+            if st.session_state.pdf_font_status["status"] == "embedded":
+                if st.button("重新生成 PDF", key="retry_pdf_export"):
+                    publish_final_report(current_report())
+                    st.rerun()
         with st.expander("Preview", expanded=False):
             st.markdown(st.session_state.report_markdown or "暂无报告内容。")

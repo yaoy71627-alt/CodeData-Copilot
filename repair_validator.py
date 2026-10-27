@@ -502,6 +502,11 @@ def _source_replacement(flow, suggestion, before, after):
 
 def _schema_columns(flow, data_results):
     """Use only the dataset resolved by this file, never union unrelated schemas."""
+    if flow.get('strict_dataset_binding'):
+        if flow.get('association_status') != 'matched':
+            return set()
+        matching = [entry for entry in data_results or [] if entry.get('file') == flow.get('bound_dataset_name')]
+        return set(matching[0].get('result', matching[0]).get('data_types', {})) if len(matching) == 1 else set()
     sources = [item.get("path") or item.get("file") for item in flow.get("source_data", [])]
     # The analyzer records the literal path under source as well in older flows.
     sources += [item.get("source") for item in flow.get("source_data", [])]

@@ -1,0 +1,611 @@
+{
+  "schema_version": 1,
+  "ruleset": "batch-d-subset-v1",
+  "scope": "非穷尽、静态源证据复核子集；待用户裁定；不是完整人工注入清单，不代表全项目准确率。",
+  "annotation_origin": "用户审计清单与固定源文件/数据静态复核；无独立人工双人标注",
+  "inputs": {
+    "titanic": {
+      "titanic-prediction-dl-vs-ml_问题案例(1).ipynb": "d5cecdbca5bbbec2e42de4bf4eb812259ebda67bcfdc1df3fdcf49ead08b61db",
+      "train_问题案例.csv": "e76612d5ee0ab2d7fbf3b620ab127fde5014ff8dda533cad15f7b5beda192204"
+    },
+    "cardekho": {
+      "cardekho-price-prediction-pga64(1).ipynb": "c0ea40655f6b77f786ab340cba7230bcbb466c8553652287a01fec2a9a79eb44",
+      "cardekho_dataset.csv": "72481e7f9dbe00166742504d68fa5be466a0f271271c536316e1bf1af96a38b0"
+    },
+    "batch_b": {
+      "retrieved_utc": "2026-10-19",
+      "execution": "Static analysis only; downloaded project code never executed",
+      "files": [
+        {
+          "path": "ibm/employee-attrition.ipynb",
+          "repository": "IBM/employee-attrition-aif360",
+          "commit": "13287d5f717dc978eda249aef4665e04c7cec8b0",
+          "source_path": "notebooks/employee-attrition.ipynb",
+          "url": "https://raw.githubusercontent.com/IBM/employee-attrition-aif360/13287d5f717dc978eda249aef4665e04c7cec8b0/notebooks/employee-attrition.ipynb",
+          "sha256": "0dfc627f37269fafd41a4ba4ecba3e25b5d66fca3f8f28a1fef1565b04f130b6"
+        },
+        {
+          "path": "ibm/emp_attrition.csv",
+          "repository": "IBM/employee-attrition-aif360",
+          "commit": "13287d5f717dc978eda249aef4665e04c7cec8b0",
+          "source_path": "data/emp_attrition.csv",
+          "url": "https://raw.githubusercontent.com/IBM/employee-attrition-aif360/13287d5f717dc978eda249aef4665e04c7cec8b0/data/emp_attrition.csv",
+          "sha256": "a5c31e38bd7fafc9bc333884eb181b06b41b8e5e488e8f7ccb27199fb3be7659"
+        },
+        {
+          "path": "ibm/LICENSE",
+          "repository": "IBM/employee-attrition-aif360",
+          "commit": "13287d5f717dc978eda249aef4665e04c7cec8b0",
+          "source_path": "LICENSE",
+          "url": "https://raw.githubusercontent.com/IBM/employee-attrition-aif360/13287d5f717dc978eda249aef4665e04c7cec8b0/LICENSE",
+          "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+        },
+        {
+          "path": "telco/src/analysis.py",
+          "repository": "adammorphy/Telco_Customer_Churn_Prediction_Group12",
+          "commit": "acb6710ddc334bc270e379c9a98bc560347bf142",
+          "source_path": "src/analysis.py",
+          "url": "https://raw.githubusercontent.com/adammorphy/Telco_Customer_Churn_Prediction_Group12/acb6710ddc334bc270e379c9a98bc560347bf142/src/analysis.py",
+          "sha256": "93522ef7e2855751b3d9177d12aae51343cd27059db5bdfa67518106ea5bd6fa"
+        },
+        {
+          "path": "telco/src/data_download.py",
+          "repository": "adammorphy/Telco_Customer_Churn_Prediction_Group12",
+          "commit": "acb6710ddc334bc270e379c9a98bc560347bf142",
+          "source_path": "src/data_download.py",
+          "url": "https://raw.githubusercontent.com/adammorphy/Telco_Customer_Churn_Prediction_Group12/acb6710ddc334bc270e379c9a98bc560347bf142/src/data_download.py",
+          "sha256": "315ecc51d043f82e01720246ea42d2da3e574402f1509c70f6cf78e3923667b6"
+        },
+        {
+          "path": "telco/src/pre_process_script.py",
+          "repository": "adammorphy/Telco_Customer_Churn_Prediction_Group12",
+          "commit": "acb6710ddc334bc270e379c9a98bc560347bf142",
+          "source_path": "src/pre_process_script.py",
+          "url": "https://raw.githubusercontent.com/adammorphy/Telco_Customer_Churn_Prediction_Group12/acb6710ddc334bc270e379c9a98bc560347bf142/src/pre_process_script.py",
+          "sha256": "b6637b64cf59414a5a96bb5cda93701ae95d86c8a8d2887bd0b2f1a485d97189"
+        },
+        {
+          "path": "telco/src/eda_script.py",
+          "repository": "adammorphy/Telco_Customer_Churn_Prediction_Group12",
+          "commit": "acb6710ddc334bc270e379c9a98bc560347bf142",
+          "source_path": "src/eda_script.py",
+          "url": "https://raw.githubusercontent.com/adammorphy/Telco_Customer_Churn_Prediction_Group12/acb6710ddc334bc270e379c9a98bc560347bf142/src/eda_script.py",
+          "sha256": "829e43fa4f8549e81a6e4fdffdfdc5643ac91801fb194c353567288c1511acf1"
+        },
+        {
+          "path": "telco/README.md",
+          "repository": "adammorphy/Telco_Customer_Churn_Prediction_Group12",
+          "commit": "acb6710ddc334bc270e379c9a98bc560347bf142",
+          "source_path": "README.md",
+          "url": "https://raw.githubusercontent.com/adammorphy/Telco_Customer_Churn_Prediction_Group12/acb6710ddc334bc270e379c9a98bc560347bf142/README.md",
+          "sha256": "b933cbc3946de342e8777b68b37ab3fb54a73e7ed6249bdfbaff278f8e3cfd65"
+        },
+        {
+          "path": "telco/LICENSE",
+          "repository": "adammorphy/Telco_Customer_Churn_Prediction_Group12",
+          "commit": "acb6710ddc334bc270e379c9a98bc560347bf142",
+          "source_path": "LICENSE",
+          "url": "https://raw.githubusercontent.com/adammorphy/Telco_Customer_Churn_Prediction_Group12/acb6710ddc334bc270e379c9a98bc560347bf142/LICENSE",
+          "sha256": "430fcca847ffb30b98f536bde3df22a5288a4b5bc1f3c659427356268818566c"
+        }
+      ]
+    },
+    "batch_c": [
+      {
+        "path": "Makefile",
+        "sha256": "e7947158e0077db9a56a1a6d461c42dc47944d1d08665afa53406ba3566c4feb",
+        "repository": "adammorphy/Telco_Customer_Churn_Prediction_Group12",
+        "commit": "acb6710ddc334bc270e379c9a98bc560347bf142",
+        "source_path": "Makefile"
+      },
+      {
+        "path": "data/raw/IBM-Telco-Customer-Churn.csv",
+        "sha256": "a0ea74c48c1063be89a73ce3fb868593604c0129f2bf581934f04983d728b3b5",
+        "repository": "adammorphy/Telco_Customer_Churn_Prediction_Group12",
+        "commit": "acb6710ddc334bc270e379c9a98bc560347bf142",
+        "source_path": "data/raw/IBM-Telco-Customer-Churn.csv"
+      },
+      {
+        "path": "data/processed/train_df.csv",
+        "sha256": "34b46c0101305e7b99420408ccca9ff7d1e60da372107f8c753ee722984dfd7b",
+        "repository": "adammorphy/Telco_Customer_Churn_Prediction_Group12",
+        "commit": "acb6710ddc334bc270e379c9a98bc560347bf142",
+        "source_path": "data/processed/train_df.csv"
+      },
+      {
+        "path": "data/processed/test_df.csv",
+        "sha256": "4e428497fdfb4ff5814f3a294c0a3914bd46fca0179fb25c7fd1e56f3b3e0a9e",
+        "repository": "adammorphy/Telco_Customer_Churn_Prediction_Group12",
+        "commit": "acb6710ddc334bc270e379c9a98bc560347bf142",
+        "source_path": "data/processed/test_df.csv"
+      }
+    ]
+  },
+  "cases": {
+    "titanic": {
+      "positives": [
+        {
+          "truth_id": "TITANIC-01",
+          "rule_id": "CODE_DROPNA_SAMPLE_LOSS",
+          "location": {
+            "file": "titanic-prediction-dl-vs-ml_问题案例(1).ipynb",
+            "cell": 5,
+            "line": 7
+          },
+          "verification_status": "static_risk",
+          "allowed_severities": [
+            "Medium"
+          ],
+          "evidence_contains": [
+            "dropna"
+          ],
+          "rationale": "源 Notebook 静态路径审查；未运行训练或性能对照。",
+          "allowed_confidences": [
+            "High"
+          ]
+        },
+        {
+          "truth_id": "TITANIC-02",
+          "rule_id": "CODE_PREPROCESS_BEFORE_SPLIT",
+          "location": {
+            "file": "titanic-prediction-dl-vs-ml_问题案例(1).ipynb",
+            "cell": 5,
+            "line": 13
+          },
+          "verification_status": "static_risk",
+          "allowed_severities": [
+            "High"
+          ],
+          "evidence_contains": [
+            "scaler.fit_transform(X)"
+          ],
+          "rationale": "源 Notebook 静态路径审查；未运行训练或性能对照。",
+          "allowed_confidences": [
+            "High"
+          ]
+        },
+        {
+          "truth_id": "TITANIC-03",
+          "rule_id": "CODE_NO_CROSS_VALIDATION",
+          "location": {
+            "file": "titanic-prediction-dl-vs-ml_问题案例(1).ipynb",
+            "cell": 7,
+            "line": 11
+          },
+          "verification_status": "static_risk",
+          "allowed_severities": [
+            "Low"
+          ],
+          "evidence_contains": [
+            "model.fit"
+          ],
+          "rationale": "源 Notebook 静态路径审查；未运行训练或性能对照。",
+          "allowed_confidences": [
+            "Medium"
+          ]
+        },
+        {
+          "truth_id": "TITANIC-04",
+          "rule_id": "CODE_SINGLE_CLASSIFICATION_METRIC",
+          "location": {
+            "file": "titanic-prediction-dl-vs-ml_问题案例(1).ipynb",
+            "cell": 7,
+            "line": 13
+          },
+          "verification_status": "static_risk",
+          "allowed_severities": [
+            "Low"
+          ],
+          "evidence_contains": [
+            "accuracy_score"
+          ],
+          "rationale": "源 Notebook 静态路径审查；未运行训练或性能对照。",
+          "allowed_confidences": [
+            "High"
+          ]
+        },
+        {
+          "truth_id": "TITANIC-05",
+          "rule_id": "CODE_TEST_SET_OVERUSE",
+          "location": {
+            "file": "titanic-prediction-dl-vs-ml_问题案例(1).ipynb",
+            "cell": 7,
+            "line": 13
+          },
+          "verification_status": "static_risk",
+          "allowed_severities": [
+            "Medium"
+          ],
+          "evidence_contains": [
+            "accuracy_score"
+          ],
+          "rationale": "源 Notebook 静态路径审查；未运行训练或性能对照。",
+          "allowed_confidences": [
+            "Medium"
+          ]
+        },
+        {
+          "truth_id": "TITANIC-06",
+          "rule_id": "DQ_MISSING_VALUES",
+          "location": {
+            "file": "train_问题案例.csv",
+            "cell": null,
+            "line": null,
+            "column": "Age"
+          },
+          "verification_status": "needs_review",
+          "allowed_severities": [
+            "Medium"
+          ],
+          "evidence_contains": [
+            "212/916"
+          ],
+          "rationale": "CSV 静态记录事实；候选业务约束需人工确认。行号为分析器零基索引。",
+          "allowed_confidences": [
+            "High"
+          ]
+        },
+        {
+          "truth_id": "TITANIC-07",
+          "rule_id": "DQ_MISSING_VALUES",
+          "location": {
+            "file": "train_问题案例.csv",
+            "cell": null,
+            "line": null,
+            "column": "Cabin"
+          },
+          "verification_status": "needs_review",
+          "allowed_severities": [
+            "High"
+          ],
+          "evidence_contains": [
+            "707/916"
+          ],
+          "rationale": "CSV 静态记录事实；候选业务约束需人工确认。行号为分析器零基索引。",
+          "allowed_confidences": [
+            "High"
+          ]
+        },
+        {
+          "truth_id": "TITANIC-08",
+          "rule_id": "DQ_DUPLICATE_ROWS",
+          "location": {
+            "file": "train_问题案例.csv",
+            "cell": null,
+            "line": null
+          },
+          "verification_status": "needs_review",
+          "allowed_severities": [
+            "Medium"
+          ],
+          "evidence_contains": [
+            "25/916"
+          ],
+          "rationale": "CSV 静态记录事实；候选业务约束需人工确认。行号为分析器零基索引。",
+          "allowed_confidences": [
+            "High"
+          ]
+        },
+        {
+          "truth_id": "TITANIC-09",
+          "rule_id": "DQ_POTENTIAL_NON_NEGATIVE_VIOLATION",
+          "location": {
+            "file": "train_问题案例.csv",
+            "cell": null,
+            "line": null,
+            "column": "Age"
+          },
+          "verification_status": "needs_review",
+          "allowed_severities": [
+            "Medium"
+          ],
+          "evidence_contains": [
+            "234, 381, 426, 646"
+          ],
+          "rationale": "CSV 静态记录事实；候选业务约束需人工确认。行号为分析器零基索引。",
+          "allowed_confidences": [
+            "Medium"
+          ]
+        },
+        {
+          "truth_id": "TITANIC-10",
+          "rule_id": "DQ_POTENTIAL_NON_NEGATIVE_VIOLATION",
+          "location": {
+            "file": "train_问题案例.csv",
+            "cell": null,
+            "line": null,
+            "column": "Fare"
+          },
+          "verification_status": "needs_review",
+          "allowed_severities": [
+            "Medium"
+          ],
+          "evidence_contains": [
+            "52, 246, 389, 822"
+          ],
+          "rationale": "CSV 静态记录事实；候选业务约束需人工确认。行号为分析器零基索引。",
+          "allowed_confidences": [
+            "Medium"
+          ]
+        }
+      ],
+      "negatives": [
+        {
+          "truth_id": "TITANIC-N1",
+          "selector": {
+            "rule_id": "CODE_PREPROCESS_BEFORE_SPLIT",
+            "verification_status": "confirmed_error"
+          },
+          "rationale": "预处理泄漏风险不能升级为已证实错误或性能效果。"
+        }
+      ]
+    },
+    "cardekho": {
+      "positives": [
+        {
+          "truth_id": "CARDEKHO-01",
+          "rule_id": "CODE_NO_CROSS_VALIDATION",
+          "location": {
+            "file": "cardekho-price-prediction-pga64(1).ipynb",
+            "cell": 48,
+            "line": 9
+          },
+          "verification_status": "static_risk",
+          "allowed_severities": [
+            "Low"
+          ],
+          "evidence_contains": [
+            "model.fit"
+          ],
+          "rationale": "按最终协调后的 Notebook 路径判断，不能按原始 cell 扫描的三项计数。",
+          "allowed_confidences": [
+            "Medium"
+          ]
+        },
+        {
+          "truth_id": "CARDEKHO-02",
+          "rule_id": "DQ_CROSS_SPLIT_FEATURE_COMBINATIONS",
+          "location": {
+            "file": "cardekho_dataset.csv",
+            "cell": null,
+            "line": null
+          },
+          "verification_status": "needs_review",
+          "allowed_severities": [
+            "Low"
+          ],
+          "evidence_contains": [
+            "cross-split groups=384",
+            "shared rows=975"
+          ],
+          "rationale": "特征组合相同不等于同一车辆；不是确定性实体泄漏。",
+          "allowed_confidences": [
+            "Medium"
+          ]
+        }
+      ],
+      "negatives": [
+        {
+          "truth_id": "CARDEKHO-N1",
+          "selector": {
+            "rule_id": "DQ_*",
+            "verification_status": "confirmed_error"
+          },
+          "rationale": "统计分布或相同车型特征不能直接认定业务错误。"
+        },
+        {
+          "truth_id": "CARDEKHO-N2",
+          "selector": {
+            "rule_id": "DQ_CROSS_SPLIT_ENTITY_ID_OVERLAP"
+          },
+          "rationale": "数据中没有可靠车辆实体标识支持确定性实体泄漏。"
+        }
+      ]
+    },
+    "ibm": {
+      "positives": [
+        {
+          "truth_id": "IBM-01",
+          "rule_id": "CODE_SKLEARN_LEGACY_API",
+          "location": {
+            "file": "employee-attrition.ipynb",
+            "cell": 10,
+            "line": 23
+          },
+          "verification_status": "needs_review",
+          "allowed_severities": [
+            "Low",
+            "Medium"
+          ],
+          "evidence_contains": [
+            "sklearn.cross_validation"
+          ],
+          "rationale": "未提供可判定的环境版本，不能直接确认运行失败。",
+          "allowed_confidences": [
+            "Medium"
+          ]
+        },
+        {
+          "truth_id": "IBM-02",
+          "rule_id": "CODE_SLICE_TEST_SAMPLE",
+          "location": {
+            "file": "employee-attrition.ipynb",
+            "cell": 109,
+            "line": 2
+          },
+          "verification_status": "needs_review",
+          "allowed_severities": [
+            "Medium",
+            "High"
+          ],
+          "evidence_contains": [
+            "1 行",
+            "部署连通性烟测"
+          ],
+          "rationale": "原始注释说明仅作部署请求烟测；不能据此认定泛化评价错误。",
+          "allowed_confidences": [
+            "Medium"
+          ]
+        }
+      ],
+      "negatives": []
+    },
+    "telco": {
+      "positives": [
+        {
+          "truth_id": "TELCO-01",
+          "rule_id": "CODE_ONEHOT_SPARSE_API",
+          "location": {
+            "file": "src/analysis.py",
+            "cell": null,
+            "line": 190
+          },
+          "verification_status": "needs_review",
+          "allowed_severities": [
+            "Low",
+            "Medium"
+          ],
+          "evidence_contains": [
+            "sparse"
+          ],
+          "rationale": "固定提交源文件审查；兼容性依赖版本未知，业务含义和异常执行路径保留限制。",
+          "allowed_confidences": [
+            "Medium"
+          ]
+        },
+        {
+          "truth_id": "TELCO-02",
+          "rule_id": "CODE_PANDAS_APPEND",
+          "location": {
+            "file": "src/eda_script.py",
+            "cell": null,
+            "line": 102
+          },
+          "verification_status": "needs_review",
+          "allowed_severities": [
+            "Low",
+            "Medium"
+          ],
+          "evidence_contains": [
+            "DataFrame.append"
+          ],
+          "rationale": "固定提交源文件审查；兼容性依赖版本未知，业务含义和异常执行路径保留限制。",
+          "allowed_confidences": [
+            "Medium"
+          ]
+        },
+        {
+          "truth_id": "TELCO-03",
+          "rule_id": "CODE_CHAINED_ASSIGNMENT",
+          "location": {
+            "file": "src/pre_process_script.py",
+            "cell": null,
+            "line": 49
+          },
+          "verification_status": "static_risk",
+          "allowed_severities": [
+            "Medium"
+          ],
+          "evidence_contains": [
+            "TotalCharges"
+          ],
+          "rationale": "固定提交源文件审查；兼容性依赖版本未知，业务含义和异常执行路径保留限制。",
+          "allowed_confidences": [
+            "High"
+          ]
+        },
+        {
+          "truth_id": "TELCO-04",
+          "rule_id": "CODE_DUPLICATE_CHECK_CALL",
+          "location": {
+            "file": "src/analysis.py",
+            "cell": null,
+            "line": 69
+          },
+          "verification_status": "needs_review",
+          "allowed_severities": [
+            "Low",
+            "Medium"
+          ],
+          "evidence_contains": [
+            "X_train"
+          ],
+          "rationale": "固定提交源文件审查；兼容性依赖版本未知，业务含义和异常执行路径保留限制。",
+          "allowed_confidences": [
+            "Low"
+          ]
+        },
+        {
+          "truth_id": "TELCO-05",
+          "rule_id": "CODE_UNUSED_STATUS_COMPARISON",
+          "location": {
+            "file": "src/data_download.py",
+            "cell": null,
+            "line": 29
+          },
+          "verification_status": "confirmed_error",
+          "allowed_severities": [
+            "Medium"
+          ],
+          "evidence_contains": [
+            "独立表达式"
+          ],
+          "rationale": "固定提交源文件审查；兼容性依赖版本未知，业务含义和异常执行路径保留限制。",
+          "allowed_confidences": [
+            "High"
+          ]
+        },
+        {
+          "truth_id": "TELCO-06",
+          "rule_id": "CODE_DOCUMENTED_SPLIT_MISMATCH",
+          "location": {
+            "file": "src/pre_process_script.py",
+            "cell": null,
+            "line": 67
+          },
+          "verification_status": "needs_review",
+          "allowed_severities": [
+            "Medium"
+          ],
+          "evidence_contains": [
+            "README.md:18",
+            "test_size=0.3"
+          ],
+          "rationale": "固定提交源文件审查；兼容性依赖版本未知，业务含义和异常执行路径保留限制。",
+          "allowed_confidences": [
+            "Medium"
+          ]
+        },
+        {
+          "truth_id": "TELCO-07",
+          "rule_id": "CODE_EXCEPTION_UNBOUND_VARIABLE",
+          "location": {
+            "file": "src/analysis.py",
+            "cell": null,
+            "line": 46
+          },
+          "verification_status": "static_risk",
+          "allowed_severities": [
+            "Medium"
+          ],
+          "evidence_contains": [
+            "test_df, train_df"
+          ],
+          "rationale": "固定提交源文件审查；兼容性依赖版本未知，业务含义和异常执行路径保留限制。",
+          "allowed_confidences": [
+            "Medium"
+          ]
+        }
+      ],
+      "negatives": [
+        {
+          "truth_id": "TELCO-N1",
+          "selector": {
+            "rule_id": "CODE_NO_CROSS_VALIDATION"
+          },
+          "rationale": "项目已有 GridSearchCV。"
+        }
+      ]
+    }
+  }
+}
